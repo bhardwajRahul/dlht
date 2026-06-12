@@ -1,16 +1,42 @@
 module protocol {
   import types.* from "./types"
 
-  const numBins: int
+  const maxGen: int            // generations 0..maxGen may exist (D3: configs use 0, 1, or 2)
   const slotsPerBin: int
-  const hash: KEY -> int
+  const hashRaw: KEY -> int    // abstract raw hash, >= 0
 
   type BinIdx = int
   type SlotIdx = int
+  type GenIdx = int
 
-  pure val binDomain: Set[BinIdx] = 1.to(numBins)
+  pure val genDomain: Set[GenIdx] = 0.to(maxGen)
+  // gen g owns bins genBase(g) .. genBase(g)+sizeAt(g)-1; growth factor 2
+  // (Go's 8x/4x tiering is a constant-factor concern, design §3).
+  // pow2 is a CLOSED FORM, not a range-fold: Apalache requires constant
+  // integer bounds in `a.to(b)` and does not constant-fold ApaFoldSet, so a
+  // fold-defined totalBins breaks every `quint verify` stage ("Expected a
+  // constant integer range"). The explicit chain is exact for the arguments
+  // that occur under maxGenCap (g <= maxGen + 1 <= 3) and Apalache's
+  // ConstSimplifier reduces it to a literal at preprocessing time.
+  pure def pow2(g: int): int =
+    if (g <= 0) 1 else if (g == 1) 2 else if (g == 2) 4 else 8
+  pure def sizeAt(g: GenIdx): int = pow2(g)
+  pure def genBase(g: GenIdx): int = pow2(g)            // gen0->1, gen1->2, gen2->4
+  pure val totalBins: int = pow2(maxGen + 1) - 1
+  pure val binDomain: Set[BinIdx] = 1.to(totalBins)
   pure val slotIdx: Set[SlotIdx] = 1.to(slotsPerBin)
   pure val slotIdxExt: Set[SlotIdx] = Set(0).union(slotIdx)
+  // MAX-fold, not last-qualifier-wins: Quint set folds visit in UNSPECIFIED
+  // order, so `if (b >= genBase(g)) g else acc` would be nondeterministic
+  // (review finding). Taking the max of qualifying gens is order-independent.
+  pure def genOfBin(b: BinIdx): GenIdx =
+    genDomain.fold(0, (acc, g) => if (genBase(g) <= b and g > acc) g else acc)
+  pure def binFor(k: KEY, g: GenIdx): BinIdx = genBase(g) + hashRaw.get(k) % sizeAt(g)
+  pure def childrenOf(b: BinIdx): Set[BinIdx] = {
+    val g = genOfBin(b)
+    val off = b - genBase(g)
+    Set(genBase(g + 1) + off, genBase(g + 1) + off + sizeAt(g))
+  }
 
   type SlotState = | Invalid | Trying | Valid | Shadow
   type PC =
@@ -19,10 +45,12 @@ module protocol {
     | PcI1 | PcI2 | PcI3 | PcI4 | PcI5 | PcI6
     | PcP1 | PcP2 | PcP3 | PcP4 | PcP5 | PcP6 | PcP7
     | PcD1 | PcD2 | PcD3 | PcD4 | PcD5 | PcD6 | PcD7 | PcD8
-    | PcLC1 | PcLC2 | PcLC3 | PcLC4 | PcLC5 | PcLC6 | PcLC7 | PcLC8 | PcLC9
+    | PcLC1 | PcLC2 | PcLC3 | PcLC4 | PcLC5 | PcLC6 | PcLC7 | PcLC8 | PcLC9 | PcLC10
 
+  type BinState = | NoTransfer | InTransfer | DoneTransfer
   type Header = {
     version: int,
+    binState: BinState,
     slotState: SlotIdx -> SlotState,
   }
   type LocalState = {
@@ -31,6 +59,7 @@ module protocol {
     hLoop: Header,
     expectedVal: Option[VAL],
     expectedTag: Option[int],
+    gen: GenIdx,
   }
 
   var pc: PROC -> PC
@@ -39,20 +68,26 @@ module protocol {
   var ret: PROC -> Option[Res]
 
   var header: BinIdx -> Header
-  var slotKey: BinIdx -> (SlotIdx -> Option[KEY])
-  var slotVal: BinIdx -> (SlotIdx -> Option[VAL])
+  var slotKey: BinIdx -> (SlotIdx -> Option[HashKey])
+  var slotVal: BinIdx -> (SlotIdx -> Option[Entry])
   var slotTag: BinIdx -> (SlotIdx -> Option[int])
   var nextTag: int
 
   var local: PROC -> LocalState
+
+  // Generation counters (design §3): activeGen models Go's m.active;
+  // maxAllocatedGen how far the indexNext chain extends. Resize-active iff
+  // maxAllocatedGen == activeGen + 1 — no separate phase var.
+  var activeGen: int
+  var maxAllocatedGen: int
 
   // Snapshot of the full shared+control state. Pure invariant families take
   // this instead of reading vars, so the induction anchor (induction.qnt) can
   // evaluate them on *constructed* candidate states before assignment.
   type SpecState = {
     header: BinIdx -> Header,
-    slotKey: BinIdx -> (SlotIdx -> Option[KEY]),
-    slotVal: BinIdx -> (SlotIdx -> Option[VAL]),
+    slotKey: BinIdx -> (SlotIdx -> Option[HashKey]),
+    slotVal: BinIdx -> (SlotIdx -> Option[Entry]),
     slotTag: BinIdx -> (SlotIdx -> Option[int]),
     nextTag: int,
     pc: PROC -> PC,
@@ -60,16 +95,22 @@ module protocol {
     arg: PROC -> Option[Arg],
     ret: PROC -> Option[Res],
     local: PROC -> LocalState,
+    activeGen: int,
+    maxAllocatedGen: int,
   }
 
   def currentSpecState: SpecState = {
     header: header, slotKey: slotKey, slotVal: slotVal, slotTag: slotTag,
     nextTag: nextTag, pc: pc, op: op, arg: arg, ret: ret, local: local,
+    activeGen: activeGen, maxAllocatedGen: maxAllocatedGen,
   }
 
-  assume numBinsDef = numBins > 0
+  assume maxGenDef = maxGen >= 0
+  // Design D3 caps configs at 2 resizes / 3 generations; pow2's closed form
+  // and the refinement authority walk both rest on this cap.
+  assume maxGenCap = maxGen <= 2
   assume slotsPerBinDef = slotsPerBin > 0
-  assume hashDef = keyDomain.forall(k => binDomain.contains(hash.get(k)))
+  assume hashRawDef = keyDomain.forall(k => hashRaw.get(k) >= 0)
   assume finiteDomains =
     procSet.isFinite() and
     keyDomain.isFinite() and
@@ -83,6 +124,7 @@ module protocol {
 
   pure val emptyHeader: Header = {
     version: 0,
+    binState: NoTransfer,
     slotState: slotIdx.mapBy(_ => Invalid),
   }
   pure val emptyLocal: LocalState = {
@@ -91,9 +133,8 @@ module protocol {
     hLoop: emptyHeader,
     expectedVal: None,
     expectedTag: None,
+    gen: 0,
   }
-
-  pure def binOf(k: KEY): BinIdx = hash.get(k)
 
   pure def keyOfArg(a: Arg): KEY = {
     match a {
@@ -139,48 +180,75 @@ module protocol {
     }
   }
 
-  pure def visibleSlotsByHeaderFrom(h: Header, keyMap: BinIdx -> (SlotIdx -> Option[KEY]),
-      valMap: BinIdx -> (SlotIdx -> Option[VAL]), tagMap: BinIdx -> (SlotIdx -> Option[int]),
+  // ABSTRACT visibility (refinement + transfer families): the entry's own
+  // key is ground truth — a sentineled slot stays visible (design §6).
+  pure def visibleSlotsByHeaderFrom(h: Header, valMap: BinIdx -> (SlotIdx -> Option[Entry]),
+      tagMap: BinIdx -> (SlotIdx -> Option[int]), b: BinIdx, k: KEY): Set[SlotIdx] =
+    slotIdx.filter(s =>
+      h.slotState.get(s) == Valid and
+        tagMap.get(b).get(s) != None and
+        match valMap.get(b).get(s) { | Some(e) => e.k == k | None => false }
+    )
+
+  // OPERATIONAL candidate scan (P2/D2/I2/LC2/G2): matches the slotKey hash
+  // word, as Go's bitmap does — a sentineled slot is never a candidate.
+  // Generation membership selects the bin; the hash word selects the slot.
+  pure def candidateSlotsByHeaderFrom(h: Header, keyMap: BinIdx -> (SlotIdx -> Option[HashKey]),
+      valMap: BinIdx -> (SlotIdx -> Option[Entry]), tagMap: BinIdx -> (SlotIdx -> Option[int]),
       b: BinIdx, k: KEY): Set[SlotIdx] =
     slotIdx.filter(s =>
       h.slotState.get(s) == Valid and
-        keyMap.get(b).get(s) == Some(k) and
+        keyMap.get(b).get(s) == Some(HKey(k)) and
         valMap.get(b).get(s) != None and
         tagMap.get(b).get(s) != None
     )
 
   // Shadow slots only carry a key (value is a placeholder until LC7), so the
   // filter is key-only.
-  pure def shadowSlotsByHeaderFrom(h: Header, keyMap: BinIdx -> (SlotIdx -> Option[KEY]),
+  pure def shadowSlotsByHeaderFrom(h: Header, keyMap: BinIdx -> (SlotIdx -> Option[HashKey]),
       b: BinIdx, k: KEY): Set[SlotIdx] =
     slotIdx.filter(s =>
       h.slotState.get(s) == Shadow and
-        keyMap.get(b).get(s) == Some(k)
+        keyMap.get(b).get(s) == Some(HKey(k))
     )
 
   def shadowSlotsByHeader(h: Header, b: BinIdx, k: KEY): Set[SlotIdx] =
     shadowSlotsByHeaderFrom(h, slotKey, b, k)
 
-  pure def readVisibleByHeaderFrom(h: Header, keyMap: BinIdx -> (SlotIdx -> Option[KEY]),
-      valMap: BinIdx -> (SlotIdx -> Option[VAL]), tagMap: BinIdx -> (SlotIdx -> Option[int]),
-      b: BinIdx, k: KEY): Option[VAL] = {
-    val visible = visibleSlotsByHeaderFrom(h, keyMap, valMap, tagMap, b, k)
+  pure def readVisibleByHeaderFrom(h: Header, valMap: BinIdx -> (SlotIdx -> Option[Entry]),
+      tagMap: BinIdx -> (SlotIdx -> Option[int]), b: BinIdx, k: KEY): Option[VAL] = {
+    val visible = visibleSlotsByHeaderFrom(h, valMap, tagMap, b, k)
     if (visible.size() == 0) None
-    else {
-      val s = minOr0(visible)
-      valMap.get(b).get(s)
-    }
+    else match valMap.get(b).get(minOr0(visible)) { | Some(e) => Some(e.v) | None => None }
   }
 
   def visibleSlotsByHeader(h: Header, b: BinIdx, k: KEY): Set[SlotIdx] =
-    visibleSlotsByHeaderFrom(h, slotKey, slotVal, slotTag, b, k)
+    visibleSlotsByHeaderFrom(h, slotVal, slotTag, b, k)
+
+  def candidateSlotsByHeader(h: Header, b: BinIdx, k: KEY): Set[SlotIdx] =
+    candidateSlotsByHeaderFrom(h, slotKey, slotVal, slotTag, b, k)
 
   def readVisibleByHeader(h: Header, b: BinIdx, k: KEY): Option[VAL] =
-    readVisibleByHeaderFrom(h, slotKey, slotVal, slotTag, b, k)
+    readVisibleByHeaderFrom(h, slotVal, slotTag, b, k)
 
+  // The operational slot pick (P2/D2): the CANDIDATE form — Go's bitmap scan
+  // compares the hash word, so a sentineled slot is never picked (design §6).
   def slotForKeyByHeader(h: Header, b: BinIdx, k: KEY): SlotIdx = {
-    minOr0(visibleSlotsByHeader(h, b, k))
+    minOr0(candidateSlotsByHeader(h, b, k))
   }
+
+  // Pure snapshot-walk helpers for the resize daemon's per-bin transfer
+  // (design §4): the snapshot slots rsMove/rsShadowCarry must process, in
+  // order. They live HERE (not resize.qnt) because the R-family invariants
+  // (invariants.qnt) need nextSlot too, and invariants must NOT import
+  // resize — that would pull the daemon's vars into induction.qnt's
+  // instance, where indInit does not assign them.
+  pure def transferable(snap: Header): Set[SlotIdx] =
+    slotIdx.filter(s =>
+      snap.slotState.get(s) == Valid or snap.slotState.get(s) == Shadow)
+
+  pure def nextSlot(snap: Header, cur: SlotIdx): SlotIdx =
+    minOr0(transferable(snap).filter(s => s > cur))
 
   pure def opFromPC(id: PC): Op = match id {
     | PcIdle => None
@@ -216,6 +284,7 @@ module protocol {
     | PcLC7 => Some(LoadOrCompute)
     | PcLC8 => Some(LoadOrCompute)
     | PcLC9 => Some(LoadOrCompute)
+    | PcLC10 => Some(LoadOrCompute)
   }
 
   pure def opStartLine(opname: OpName): PC = match opname {
@@ -227,7 +296,7 @@ module protocol {
   }
 
   pure def updateSlotState(h: Header, s: SlotIdx, newState: SlotState): Header = {
-    { version: h.version + 1, slotState: h.slotState.set(s, newState) }
+    { version: h.version + 1, binState: h.binState, slotState: h.slotState.set(s, newState) }
   }
 
   pure def clearSlotState(h: Header, s: SlotIdx, newState: SlotState): Header = {
@@ -257,6 +326,11 @@ module protocol {
     expectedTag: t,
   }
 
+  pure def withGen(ls: LocalState, g: GenIdx): LocalState = {
+    ...ls,
+    gen: g,
+  }
+
   action unchanged_control = all {
     op' = op,
     arg' = arg,
@@ -269,6 +343,8 @@ module protocol {
     slotVal' = slotVal,
     slotTag' = slotTag,
     nextTag' = nextTag,
+    activeGen' = activeGen,
+    maxAllocatedGen' = maxAllocatedGen,
   }
 
   action unchanged_local = all {
@@ -288,6 +364,8 @@ module protocol {
     nextTag' = 1,
 
     local' = procSet.mapBy(_ => emptyLocal),
+    activeGen' = 0,
+    maxAllocatedGen' = 0,
   }
 
   action invokeLine(p) = {
@@ -300,19 +378,38 @@ module protocol {
       arg' = arg.set(p, Some(newArg)),
       ret' = ret.set(p, None),
       unchanged_shared,
-      unchanged_local,
+      // The op starts at the active generation, matching Go's
+      // m.getActiveIndex() at op entry.
+      local' = local.set(p, withGen(local.get(p), activeGen)),
     }
   }
 
   // -------------------------------- Get -----------------------------------
 
+  // Fused classification load (design §5, NORMATIVE per-site table): no
+  // non-NoTransfer h0 is ever retained. Done -> chain-walk exactly ONE
+  // generation (get.go:26-38; never a jump); InTransfer -> back off and
+  // reload m.active (insert.go:32 — may legitimately jump several gens).
   action G1(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val g = local.get(p).gen
+    val b = binFor(k, g)
+    val h = header.get(b)
     all {
       pc.get(p) == PcG1,
-      local' = local.set(p, withH0(local.get(p), header.get(b))),
-      pc' = pc.set(p, PcG2),
+      if (h.binState == NoTransfer) all {
+        // proceed: retain h0 (provably NoTransfer), stay on this gen
+        local' = local.set(p, withH0(local.get(p), h)),
+        pc' = pc.set(p, PcG2),
+      } else if (h.binState == DoneTransfer) all {
+        // chain-walk: exactly one generation forward (design §5)
+        local' = local.set(p, withGen(local.get(p), g + 1)),
+        pc' = pc.set(p, PcG1),
+      } else all {
+        // InTransfer: back off, reload m.active (may jump several gens)
+        local' = local.set(p, withGen(local.get(p), activeGen)),
+        pc' = pc.set(p, PcG1),
+      },
       unchanged_control,
       unchanged_shared,
     }
@@ -320,10 +417,13 @@ module protocol {
 
   action G2(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     all {
       pc.get(p) == PcG2,
       if (g2ReturnGuard(p)) {
+        // Entry-key read: Go's Get returns the entry's value after a
+        // hash-match scan — on a NoTransfer bin candidate ≡ entry-key
+        // (entryKeyAgreement corollary), so the simpler form is exact here.
         val result = readVisibleByHeader(local.get(p).h0, b, k)
         all {
           ret' = ret.set(p, mkResult(result != None, result)),
@@ -346,13 +446,24 @@ module protocol {
 
   // ------------------------------ Insert ----------------------------------
 
+  // Fused classification load — same three-branch shape as G1 (design §5).
   action I1(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val g = local.get(p).gen
+    val b = binFor(k, g)
+    val h = header.get(b)
     all {
       pc.get(p) == PcI1,
-      local' = local.set(p, withH0(local.get(p), header.get(b))),
-      pc' = pc.set(p, PcI2),
+      if (h.binState == NoTransfer) all {
+        local' = local.set(p, withH0(local.get(p), h)),
+        pc' = pc.set(p, PcI2),
+      } else if (h.binState == DoneTransfer) all {
+        local' = local.set(p, withGen(local.get(p), g + 1)),
+        pc' = pc.set(p, PcI1),
+      } else all {
+        local' = local.set(p, withGen(local.get(p), activeGen)),
+        pc' = pc.set(p, PcI1),
+      },
       unchanged_control,
       unchanged_shared,
     }
@@ -360,7 +471,7 @@ module protocol {
 
   action I2(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val h = local.get(p).h0
     all {
       pc.get(p) == PcI2,
@@ -415,7 +526,7 @@ module protocol {
 
   action I3(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcI3,
@@ -435,6 +546,8 @@ module protocol {
       slotVal' = slotVal,
       slotTag' = slotTag,
       nextTag' = nextTag,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
       unchanged_local,
     }
   }
@@ -442,24 +555,26 @@ module protocol {
   action I4(p) = {
     val k = keyOfProc(p)
     val v = valOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcI4,
-      slotKey' = slotKey.set(b, slotKey.get(b).set(s, Some(k))),
-      slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some(v))),
+      slotKey' = slotKey.set(b, slotKey.get(b).set(s, Some(HKey(k)))),
+      slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some({ k: k, v: v }))),
       slotTag' = slotTag.set(b, slotTag.get(b).set(s, Some(nextTag))),
       nextTag' = nextTag + 1,
       pc' = pc.set(p, PcI5),
       unchanged_control,
       header' = header,
       local' = local,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
     }
   }
 
   action I5(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcI5,
@@ -484,17 +599,25 @@ module protocol {
       slotVal' = slotVal,
       slotTag' = slotTag,
       nextTag' = nextTag,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
       unchanged_local,
     }
   }
 
   action I6(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcI6,
-      if (s != 0 and header.get(b).slotState.get(s) == Trying and slotKey.get(b).get(s) == Some(k)) {
+      // Unreserve REFUSAL (design §5, insert.go:169): the CAS requires a
+      // NoTransfer bin — on a transferring/dead bin the Trying slot is
+      // ABANDONED (stale key/val/tag persist) and the owner redirects via
+      // the fused I1 classification.
+      if (s != 0 and header.get(b).slotState.get(s) == Trying and
+          slotKey.get(b).get(s) == Some(HKey(k)) and
+          header.get(b).binState == NoTransfer) {
         all {
           header' = header.set(b, updateSlotState(header.get(b), s, Invalid)),
           slotVal' = slotVal.set(b, slotVal.get(b).set(s, None)),
@@ -511,19 +634,32 @@ module protocol {
       unchanged_control,
       slotKey' = slotKey,
       nextTag' = nextTag,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
       unchanged_local,
     }
   }
 
   // -------------------------------- Put -----------------------------------
 
+  // Fused classification load — same three-branch shape as G1 (design §5).
   action P1(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val g = local.get(p).gen
+    val b = binFor(k, g)
+    val h = header.get(b)
     all {
       pc.get(p) == PcP1,
-      local' = local.set(p, withH0(local.get(p), header.get(b))),
-      pc' = pc.set(p, PcP2),
+      if (h.binState == NoTransfer) all {
+        local' = local.set(p, withH0(local.get(p), h)),
+        pc' = pc.set(p, PcP2),
+      } else if (h.binState == DoneTransfer) all {
+        local' = local.set(p, withGen(local.get(p), g + 1)),
+        pc' = pc.set(p, PcP1),
+      } else all {
+        local' = local.set(p, withGen(local.get(p), activeGen)),
+        pc' = pc.set(p, PcP1),
+      },
       unchanged_control,
       unchanged_shared,
     }
@@ -531,7 +667,7 @@ module protocol {
 
   action P2(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     all {
       pc.get(p) == PcP2,
       local' = local.set(p, withTargetSlot(local.get(p), slotForKeyByHeader(local.get(p).h0, b, k))),
@@ -543,7 +679,7 @@ module protocol {
 
   action P3(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     all {
       pc.get(p) == PcP3,
       if (header.get(b) != local.get(p).h0) {
@@ -573,9 +709,14 @@ module protocol {
     }
   }
 
+  // NO binState check here — design §5, put.go:80-119. The pre-sentinel Put
+  // must remain able to linearize mid-transfer and be carried by rsMove;
+  // classifying here would erase exactly the behavior the sentinel-cut
+  // scenarios verify. Put is protected by the sentinel instead: P5/P7's
+  // slotKey == Some(HKey(k)) fails against HSentinel -> retry -> classify.
   action P4(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     all {
       pc.get(p) == PcP4,
       local' = local.set(p, withHLoop(local.get(p), header.get(b))),
@@ -587,11 +728,11 @@ module protocol {
 
   action P5(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     val retry =
       local.get(p).hLoop.slotState.get(s) != Valid or
-        slotKey.get(b).get(s) != Some(k) or
+        slotKey.get(b).get(s) != Some(HKey(k)) or
         slotVal.get(b).get(s) == None
     all {
       pc.get(p) == PcP5,
@@ -603,7 +744,10 @@ module protocol {
       } else {
         all {
           pc' = pc.set(p, PcP6),
-          local' = local.set(p, withExpected(local.get(p), slotVal.get(b).get(s), slotTag.get(b).get(s))),
+          // expectedVal stays Option[VAL] (it feeds ret): project the entry.
+          local' = local.set(p, withExpected(local.get(p),
+            match slotVal.get(b).get(s) { | Some(e) => Some(e.v) | None => None },
+            slotTag.get(b).get(s))),
         }
       },
       unchanged_control,
@@ -613,7 +757,7 @@ module protocol {
 
   action P6(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     all {
       pc.get(p) == PcP6,
       if (header.get(b) != local.get(p).hLoop) {
@@ -630,13 +774,13 @@ module protocol {
   action P7(p) = {
     val k = keyOfProc(p)
     val v = valOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcP7,
       if (p7SuccessGuard(p)) {
         all {
-          slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some(v))),
+          slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some({ k: k, v: v }))),
           slotTag' = slotTag.set(b, slotTag.get(b).set(s, Some(nextTag))),
           nextTag' = nextTag + 1,
           ret' = ret.set(p, mkResult(true, local.get(p).expectedVal)),
@@ -658,18 +802,31 @@ module protocol {
       header' = header,
       slotKey' = slotKey,
       local' = local,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
     }
   }
 
   // ------------------------------- Delete ----------------------------------
 
+  // Fused classification load — same three-branch shape as G1 (design §5).
   action D1(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val g = local.get(p).gen
+    val b = binFor(k, g)
+    val h = header.get(b)
     all {
       pc.get(p) == PcD1,
-      local' = local.set(p, withH0(local.get(p), header.get(b))),
-      pc' = pc.set(p, PcD2),
+      if (h.binState == NoTransfer) all {
+        local' = local.set(p, withH0(local.get(p), h)),
+        pc' = pc.set(p, PcD2),
+      } else if (h.binState == DoneTransfer) all {
+        local' = local.set(p, withGen(local.get(p), g + 1)),
+        pc' = pc.set(p, PcD1),
+      } else all {
+        local' = local.set(p, withGen(local.get(p), activeGen)),
+        pc' = pc.set(p, PcD1),
+      },
       unchanged_control,
       unchanged_shared,
     }
@@ -677,7 +834,7 @@ module protocol {
 
   action D2(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     all {
       pc.get(p) == PcD2,
       local' = local.set(p, withTargetSlot(local.get(p), slotForKeyByHeader(local.get(p).h0, b, k))),
@@ -689,7 +846,7 @@ module protocol {
 
   action D3(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     all {
       pc.get(p) == PcD3,
       if (header.get(b) != local.get(p).h0) {
@@ -719,13 +876,26 @@ module protocol {
     }
   }
 
+  // D4 classifies its hLoop load (delete.go:89's explicit in-loop recheck,
+  // design §5): non-NoTransfer routes to a FULL retry through the fused D1
+  // classification — Done walks one gen, InTransfer reloads m.active.
   action D4(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val g = local.get(p).gen
+    val b = binFor(k, g)
+    val h = header.get(b)
     all {
       pc.get(p) == PcD4,
-      local' = local.set(p, withHLoop(local.get(p), header.get(b))),
-      pc' = pc.set(p, PcD5),
+      if (h.binState == NoTransfer) all {
+        local' = local.set(p, withHLoop(local.get(p), h)),
+        pc' = pc.set(p, PcD5),
+      } else if (h.binState == DoneTransfer) all {
+        local' = local.set(p, withGen(local.get(p), g + 1)),
+        pc' = pc.set(p, PcD1),
+      } else all {
+        local' = local.set(p, withGen(local.get(p), activeGen)),
+        pc' = pc.set(p, PcD1),
+      },
       unchanged_control,
       unchanged_shared,
     }
@@ -733,11 +903,11 @@ module protocol {
 
   action D5(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     val retry =
       local.get(p).hLoop.slotState.get(s) != Valid or
-        slotKey.get(b).get(s) != Some(k) or
+        slotKey.get(b).get(s) != Some(HKey(k)) or
         slotVal.get(b).get(s) == None
     all {
       pc.get(p) == PcD5,
@@ -749,7 +919,10 @@ module protocol {
       } else {
         all {
           pc' = pc.set(p, PcD6),
-          local' = local.set(p, withExpected(local.get(p), slotVal.get(b).get(s), slotTag.get(b).get(s))),
+          // expectedVal stays Option[VAL] (it feeds ret): project the entry.
+          local' = local.set(p, withExpected(local.get(p),
+            match slotVal.get(b).get(s) { | Some(e) => Some(e.v) | None => None },
+            slotTag.get(b).get(s))),
         }
       },
       unchanged_control,
@@ -759,7 +932,7 @@ module protocol {
 
   action D6(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     all {
       pc.get(p) == PcD6,
       if (header.get(b) != local.get(p).hLoop) {
@@ -775,12 +948,12 @@ module protocol {
 
   action D7(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcD7,
       if (
-        slotKey.get(b).get(s) == Some(k) and
+        slotKey.get(b).get(s) == Some(HKey(k)) and
         slotTag.get(b).get(s) == local.get(p).expectedTag and
         slotTag.get(b).get(s) != None and
         slotVal.get(b).get(s) != None
@@ -807,12 +980,14 @@ module protocol {
       slotKey' = slotKey,
       nextTag' = nextTag,
       local' = local,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
     }
   }
 
   action D8(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcD8,
@@ -830,6 +1005,8 @@ module protocol {
       slotTag' = slotTag,
       nextTag' = nextTag,
       local' = local,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
     }
   }
 
@@ -844,13 +1021,24 @@ module protocol {
   // clear, and aborts with a SINGLE CAS Shadow -> Invalid (see LC4's
   // implementation-contract comment).
 
+  // Fused classification load — same three-branch shape as G1 (design §5).
   action LC1(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val g = local.get(p).gen
+    val b = binFor(k, g)
+    val h = header.get(b)
     all {
       pc.get(p) == PcLC1,
-      local' = local.set(p, withH0(local.get(p), header.get(b))),
-      pc' = pc.set(p, PcLC2),
+      if (h.binState == NoTransfer) all {
+        local' = local.set(p, withH0(local.get(p), h)),
+        pc' = pc.set(p, PcLC2),
+      } else if (h.binState == DoneTransfer) all {
+        local' = local.set(p, withGen(local.get(p), g + 1)),
+        pc' = pc.set(p, PcLC1),
+      } else all {
+        local' = local.set(p, withGen(local.get(p), activeGen)),
+        pc' = pc.set(p, PcLC1),
+      },
       unchanged_control,
       unchanged_shared,
     }
@@ -858,7 +1046,7 @@ module protocol {
 
   action LC2(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val h = local.get(p).h0
     all {
       pc.get(p) == PcLC2,
@@ -913,7 +1101,7 @@ module protocol {
 
   action LC3(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcLC3,
@@ -933,13 +1121,15 @@ module protocol {
       slotVal' = slotVal,
       slotTag' = slotTag,
       nextTag' = nextTag,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
       unchanged_local,
     }
   }
 
   action LC4(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcLC4,
@@ -964,20 +1154,22 @@ module protocol {
       // derive Shadow-uniqueness from the KEY (slotKey, written before the
       // Shadow release-CAS, hence acquire-coherent for waiters), never from
       // the entry pointer.
-      slotKey' = slotKey.set(b, slotKey.get(b).set(s, Some(k))),
-      slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some(anyVal))),
+      slotKey' = slotKey.set(b, slotKey.get(b).set(s, Some(HKey(k)))),
+      slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some({ k: k, v: anyVal }))),
       slotTag' = slotTag.set(b, slotTag.get(b).set(s, Some(nextTag))),
       nextTag' = nextTag + 1,
       pc' = pc.set(p, PcLC5),
       unchanged_control,
       header' = header,
       local' = local,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
     }
   }
 
   action LC5(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcLC5,
@@ -998,18 +1190,84 @@ module protocol {
       slotVal' = slotVal,
       slotTag' = slotTag,
       nextTag' = nextTag,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
       unchanged_local,
     }
   }
 
+  // LC6 is the §5 table's HOLDER rule: spin on InTransfer (never restart —
+  // restarting would orphan the published Shadow claim), relocate on Done
+  // (PcLC10), proceed to LC7 only with a NoTransfer hLoop. This is what
+  // makes a mid-transfer commit impossible: an LC7 commit under a stable
+  // InTransfer header would turn a slot Valid mid-transfer and rsShadowCarry
+  // would copy the stale ghost — silently dropping the value at rsDone.
   action LC6(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val g = local.get(p).gen
+    val b = binFor(k, g)
+    val h = header.get(b)
     all {
       pc.get(p) == PcLC6,
-      // Post-fn: reload hLoop for the commit CAS.
-      local' = local.set(p, withHLoop(local.get(p), header.get(b))),
-      pc' = pc.set(p, PcLC7),
+      if (h.binState == NoTransfer) all {
+        // Post-fn: reload hLoop for the commit CAS.
+        local' = local.set(p, withHLoop(local.get(p), h)),
+        pc' = pc.set(p, PcLC7),
+      } else if (h.binState == DoneTransfer) all {
+        local' = local,
+        pc' = pc.set(p, PcLC10),        // relocate to the carried claim
+      } else all {
+        local' = local,                  // InTransfer: SPIN (never restart —
+        pc' = pc.set(p, PcLC6),         // restarting orphans the Shadow claim)
+      },
+      unchanged_control,
+      unchanged_shared,
+    }
+  }
+
+  // LC10: holder relocation after its bin's DoneTransfer (design §5). Finds
+  // the carried claim in the child by (Shadow ∧ HKey(k)) — unique by claim
+  // continuity — and refreshes ALL local snapshots (h0 too: leaving the
+  // parent's h0 breaks versionMonotonic/reserveBumpedVersion/snapStateAgrees
+  // at this step). Re-enters LC6: if the child is itself InTransfer/Done
+  // (2-gen configs) the LC6 classification spins/walks again.
+  action LC10(p) = {
+    val k = keyOfProc(p)
+    val g = local.get(p).gen + 1
+    val b = binFor(k, g)
+    val h = header.get(b)
+    // DOMAIN GUARD (1b anchor-proofing; review finding): pc == PcLC10 with
+    // gen == maxGen is unreachable in real runs (a maxGen bin is never
+    // Done, so LC6 never routes there), but the induction anchor can
+    // fabricate it — binFor(k, maxGen+1) lies outside binDomain, and an
+    // unconstrained out-of-domain header read would hand Apalache a
+    // spurious consecution counterexample (gen' = maxGen+1 breaking
+    // typeOK). The empty shadow set routes the fabricated state to the
+    // wait branch; h is never forced there (vals are lazy-on-use).
+    val shadows = if (g > maxGen) Set() else slotIdx.filter(s =>
+      h.slotState.get(s) == Shadow and slotKey.get(b).get(s) == Some(HKey(k)))
+    all {
+      pc.get(p) == PcLC10,
+      if (shadows.size() != 0) all {
+        local' = local.set(p, {
+          ...local.get(p),
+          gen: g,
+          targetSlot: minOr0(shadows),
+          h0: h,
+          hLoop: h,
+        }),
+        pc' = pc.set(p, PcLC6),
+      } else all {
+        // Defensive totality only: in real runs a PcLC10 proc ALWAYS finds
+        // a claim one generation ahead — rsDone requires every snapshot
+        // Shadow carried, and LC5 cannot publish a Shadow the snapshot
+        // missed (its expectedH compare fails once the bin left
+        // NoTransfer); a dead child's RESTORED Shadow also matches (that is
+        // the double-relocation stepping stone). This branch is reached
+        // only by anchor-fabricated states (see the domain guard above).
+        local' = local,
+        pc' = pc.set(p, PcLC10),
+      },
       unchanged_control,
       unchanged_shared,
     }
@@ -1019,7 +1277,7 @@ module protocol {
     val k = keyOfProc(p)
     val v = valOfProc(p)
     val save = saveOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcLC7,
@@ -1028,7 +1286,7 @@ module protocol {
           // Commit (linearization point for save=true).
           all {
             header' = header.set(b, updateSlotState(header.get(b), s, Valid)),
-            slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some(v))),
+            slotVal' = slotVal.set(b, slotVal.get(b).set(s, Some({ k: k, v: v }))),
             slotTag' = slotTag.set(b, slotTag.get(b).set(s, Some(nextTag))),
             nextTag' = nextTag + 1,
             ret' = ret.set(p, mkResult(false, Some(v))),
@@ -1075,17 +1333,23 @@ module protocol {
         }
       },
       slotKey' = slotKey,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
     }
   }
 
   // LC8 mirrors I6: unreserve on LC5 failure, then retry from LC1.
   action LC8(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcLC8,
-      if (s != 0 and header.get(b).slotState.get(s) == Trying and slotKey.get(b).get(s) == Some(k)) {
+      // Unreserve REFUSAL (design §5): see I6 — abandoned on a
+      // non-NoTransfer bin; the LC1 classification redirects.
+      if (s != 0 and header.get(b).slotState.get(s) == Trying and
+          slotKey.get(b).get(s) == Some(HKey(k)) and
+          header.get(b).binState == NoTransfer) {
         all {
           header' = header.set(b, updateSlotState(header.get(b), s, Invalid)),
           slotVal' = slotVal.set(b, slotVal.get(b).set(s, None)),
@@ -1102,6 +1366,8 @@ module protocol {
       unchanged_control,
       slotKey' = slotKey,
       nextTag' = nextTag,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
       unchanged_local,
     }
   }
@@ -1113,11 +1379,17 @@ module protocol {
   // L3/I2.5 scans, so clearing the entry pointer here cannot be observed.
   action LC9(p) = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     all {
       pc.get(p) == PcLC9,
-      if (s != 0 and header.get(b).slotState.get(s) == Trying and slotKey.get(b).get(s) == Some(k)) {
+      // Unreserve REFUSAL (design §5): the abort's cleanup CAS also refuses
+      // on a non-NoTransfer bin — the ghost val/tag stay behind in the
+      // abandoned Trying slot (daemon skips Trying slots, so they are never
+      // carried); the return (posted at LC7) completes regardless.
+      if (s != 0 and header.get(b).slotState.get(s) == Trying and
+          slotKey.get(b).get(s) == Some(HKey(k)) and
+          header.get(b).binState == NoTransfer) {
         all {
           header' = header.set(b, updateSlotState(header.get(b), s, Invalid)),
           slotVal' = slotVal.set(b, slotVal.get(b).set(s, None)),
@@ -1137,6 +1409,8 @@ module protocol {
       slotKey' = slotKey,
       nextTag' = nextTag,
       local' = local,
+      activeGen' = activeGen,
+      maxAllocatedGen' = maxAllocatedGen,
     }
   }
 
@@ -1148,42 +1422,43 @@ module protocol {
 
   def g2ReturnGuard(p: PROC): bool = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     header.get(b) == local.get(p).h0
   }
 
   def i2ReturnGuard(p: PROC): bool = {
     val k = keyOfProc(p)
-    val b = binOf(k)
-    header.get(b) == local.get(p).h0 and visibleSlotsByHeader(local.get(p).h0, b, k).size() != 0
+    val b = binFor(k, local.get(p).gen)
+    header.get(b) == local.get(p).h0 and candidateSlotsByHeader(local.get(p).h0, b, k).size() != 0
   }
 
   def i5SuccessGuard(p: PROC): bool = {
     val k = keyOfProc(p)
     val v = valOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     val expectedH = {
       version: local.get(p).h0.version + 1,
+      binState: local.get(p).h0.binState,
       slotState: local.get(p).h0.slotState.set(s, Trying),
     }
     header.get(b) == expectedH and
-      slotKey.get(b).get(s) == Some(k) and
-      slotVal.get(b).get(s) == Some(v) and
+      slotKey.get(b).get(s) == Some(HKey(k)) and
+      slotVal.get(b).get(s) == Some({ k: k, v: v }) and
       slotTag.get(b).get(s) != None
   }
 
   def keyAbsentGuard(p: PROC): bool = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     header.get(b) == local.get(p).h0 and local.get(p).targetSlot == 0
   }
 
   def p7SuccessGuard(p: PROC): bool = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
-    slotKey.get(b).get(s) == Some(k) and
+    slotKey.get(b).get(s) == Some(HKey(k)) and
       slotTag.get(b).get(s) == local.get(p).expectedTag and
       slotTag.get(b).get(s) != None and
       slotVal.get(b).get(s) != None
@@ -1191,28 +1466,29 @@ module protocol {
 
   def lc2ReturnGuard(p: PROC): bool = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val h = local.get(p).h0
-    header.get(b) == h and visibleSlotsByHeader(h, b, k).size() != 0
+    header.get(b) == h and candidateSlotsByHeader(h, b, k).size() != 0
   }
 
   def lc5SuccessGuard(p: PROC): bool = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     val expectedH = {
       version: local.get(p).h0.version + 1,
+      binState: local.get(p).h0.binState,
       slotState: local.get(p).h0.slotState.set(s, Trying),
     }
     header.get(b) == expectedH and
-      slotKey.get(b).get(s) == Some(k) and
-      slotVal.get(b).get(s) == Some(anyVal) and
+      slotKey.get(b).get(s) == Some(HKey(k)) and
+      slotVal.get(b).get(s) == Some({ k: k, v: anyVal }) and
       slotTag.get(b).get(s) != None
   }
 
   def lc7SuccessGuard(p: PROC): bool = {
     val k = keyOfProc(p)
-    val b = binOf(k)
+    val b = binFor(k, local.get(p).gen)
     val s = local.get(p).targetSlot
     header.get(b) == local.get(p).hLoop and
       local.get(p).hLoop.slotState.get(s) == Shadow
@@ -1357,6 +1633,7 @@ module protocol {
         not(lc7CommitReturnGuard(p)),
       },
       LC8(p),
+      LC10(p),
     }
   }
 
@@ -1406,6 +1683,14 @@ module protocol {
 
     binDomain.forall(b => st.header.get(b).version >= 0) and
     st.nextTag >= 1 and
+
+    // Generation-counter sanity (design §3): resize-active is
+    // maxAllocatedGen == activeGen + 1; the chain never extends further.
+    st.activeGen >= 0 and
+    st.maxAllocatedGen >= st.activeGen and
+    st.maxAllocatedGen <= maxGen and
+    st.maxAllocatedGen <= st.activeGen + 1 and
+    procSet.forall(p => genDomain.contains(st.local.get(p).gen)) and
 
     procSet.forall(p => st.op.get(p) == opFromPC(st.pc.get(p))) and
     procSet.forall(p => slotIdxExt.contains(st.local.get(p).targetSlot)) and

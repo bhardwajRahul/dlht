@@ -5,6 +5,15 @@ module types {
 
   type Option[t] = | Some(t) | None
 
+  // The slot's hash word: a real key's hash, or the transfer sentinel.
+  // HSentinel is type-distinct so it can never collide with a key (the Go
+  // even/odd parity trick is therefore out of modeled scope).
+  type HashKey = | HKey(KEY) | HSentinel
+
+  // Models Go's Entry{Key, Value}: the entry carries its OWN key, which is
+  // ground truth for abstract visibility (design §6). slotVal: Option[Entry].
+  type Entry = { k: KEY, v: VAL }
+
   type OpName = | Get | Insert | Put | Delete | LoadOrCompute
   type Op = Option[OpName]
 

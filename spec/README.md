@@ -7,9 +7,37 @@ This directory formally models the DLHT lock-free hash table and verifies it wit
 ## What is modeled
 
 `protocol.qnt` models the DLHT operations — Get, Insert, Put, Delete, and
-LoadOrCompute (with the `Shadow` slot state) — against a **single fixed-size
-index**, one atomic action per protocol step (PC-indexed state machines: Get
-G1–G2, Insert I1–I6, Put P1–P7, Delete D1–D8, LoadOrCompute LC1–LC9).
+LoadOrCompute (with the `Shadow` slot state) — one atomic action per protocol
+step (PC-indexed state machines: Get G1–G2, Insert I1–I6, Put P1–P7, Delete
+D1–D8, LoadOrCompute LC1–LC10), over a **multi-generation flat bin
+namespace** (design A′): generation *g* owns bins `2^g .. 2^(g+1)-1`,
+`binFor(k, g)` is closed-form arithmetic, and configs pick `maxGen` ∈
+{0, 1, 2} (maxGen=0 is the degenerate single-bin surface the Phase 0 results
+live on).
+
+`resize.qnt` models the **cooperative resize** as a daemon transfer machine
+(design D2 — a safety over-approximation of Go's insert-triggered + FAA
+work-stealing machinery): `rsTrigger` (allocate + indexNext publish),
+`rsBegin` (InTransfer OR **without** a version bump + pre-OR snapshot),
+`rsSentinel` (its own atomic step — the per-slot StoreLoad cut against
+Put/Delete DWCAS), `rsMove` (fused read+place into the child; skips
+concurrently-deleted entries), `rsShadowCarry` (the LoadOrCompute claim
+carry — a spec-prescribed contract; today's Go resize has no Shadow),
+`rsDone` (a snapshot **overwrite**, discarding transfer-window D8 ANDs;
+sentinels persist in dead-bin slot keys forever), and `rsFinalize`
+(`m.active` advances). `system.qnt` composes `systemStep = protocol step ∨
+daemon step`. Ops classify `binState` per the design §5 normative table:
+fused classification at every h0 load and D4 (Done → chain-walk exactly one
+generation; InTransfer → reload `m.active`), **no check at P4** (the
+pre-sentinel Put must remain carriable — put.go fidelity), unreserve refusal
+at I6/LC8/LC9 (abandoned Trying slots), and the LC holder spin/relocate rule
+(PcLC10) so a claim is never orphaned or committed mid-transfer.
+
+Out of modeled scope (documented in the design, not silently dropped): chunk
+work-stealing FAA bookkeeping and trigger timing (absorbed by the daemon
+abstraction), link buckets/arena, the sentinel even/odd parity trick (the
+modeled sentinel is type-distinct), Go's 8x/4x sizing tiers (growth factor 2),
+`Range`/`Size`/`Stats`, weak memory (spec stays SC), liveness.
 
 Key abstractions:
 - A bin is a flat array of `slotsPerBin` slots; link buckets / the link arena /
@@ -37,15 +65,26 @@ Key abstractions:
   checked in `verify.sh` stage 4 as `inv ⟹ contract` (0-step anchored,
   2-proc).
 - Every CAS / seqlock check compares a whole `Header` record
-  (`{version, slotState}`), modeling the implementation's full-64-bit header CAS.
+  (`{version, binState, slotState}`), modeling the implementation's
+  full-64-bit header CAS — transfer-awareness auto-threads through every
+  existing guard with zero per-guard edits.
+- `slotKey: Option[HashKey]` (`HKey(KEY) | HSentinel`) is the DWCAS-compare
+  hash word; `slotVal: Option[Entry]` carries the entry's OWN key, the ground
+  truth for **abstract** visibility (design §6). Operational scans
+  (candidate sets, P2/D2 slot picks) match the hash word — a sentineled slot
+  is never a candidate; the abstraction reads each key at its
+  **authoritative generation** (least non-Done bin in its chain).
 
-**Resize is not yet modeled** (it is the next phase of work — see
-`docs/superpowers/specs/2026-06-05-phase0-inductive-quint-spec-design.md` §9).
+Resize modeling follows
+`docs/superpowers/specs/2026-06-11-phase1-resize-modeling-design.md`; the
+stage-1a evidence tier is described below.
 
 ## What is proved (and how)
 
 1. **Inductive invariant** (`invariants.qnt::inv`, a conjunction of `typeOK`
-   plus 27 families). Proved *inductive*, not merely bounded:
+   plus 32 families — the 27 Phase 0 families, several adjusted for transfer
+   shapes per design §7, plus the generation-topology tier R1–R5). Proved
+   *inductive*, not merely bounded, **on the maxGen=0 configs**:
    - **Base:** `init ⟹ inv`, checked as `quint verify verify/invariants_<cfg>
      --invariant=inv --max-steps=0`.
    - **Consecution:** `inv ∧ step ⟹ inv'`, checked as `quint verify
@@ -54,10 +93,32 @@ Key abstractions:
      (the induction anchor).
 
    Configs: `1proc`, `2proc` (default), and `2proc_2key` (opt-in; see
-   [Cost](#cost-and-tiers)). All at 1 bin, 3 slots, valDomain {v1,v2}.
+   [Cost](#cost-and-tiers)). All at maxGen=0 (one gen-0 bin), 3 slots,
+   valDomain {v1,v2}.
 
    Every family carries a `//` comment naming the protocol mechanism that
    guarantees it — `inv` *is* the protocol's written, machine-checked proof.
+
+1b. **Resize evidence tier (stage 1a)** — for the resize machinery the
+   current bar is *scenarios + simulator + base cases*, deliberately **below**
+   the inductive bar (stage 1b lands consecution over the resize state;
+   stage 1c the refinement/transfer-correctness theorem):
+   - Simulator `[ok]` for `inv` AND `rsInv` (the daemon-state families
+     R6–R12, wrapped in `system.qnt`) on `system_resize_1gen` at depths
+     completing ≥1 full transfer cycle; the `system_resize_2gen` pair under
+     `DLHT_VERIFY_2GEN=1` (must pass when enabled).
+   - Base cases `[ok]` on both system configs (wired into verify.sh stage 4).
+   - Twelve directed resize scenarios (`tests/scenarios_resize.qnt`): the
+     sentinel cut from both sides (pre-sentinel Put carried / post-sentinel
+     Put redirected), the delete window carried as absent + the straggler D8
+     on a dead header, insert abandon-and-redirect in both orders
+     (reserve+fill pre-OR, and the design-§8 fill-AFTER-OR where I4's
+     unguarded write lands mid-transfer), LC relocation (commit + abort),
+     the snapStateAgrees resurrection interleaving, cross-bin isolation
+     post-resize, and — on the 2gen instance — the laggard double-walk and
+     the holder double-relocation.
+   **No consecution claims are made over the resize machinery yet**; the
+   R-families are reachable-true tier.
 
 2. **Step refinement against the atomic map** (`refinement.qnt` vs
    `types.qnt::deltaResult`). The abstraction function reads each key's visible
@@ -76,9 +137,11 @@ Key abstractions:
 4. **Directed scenarios** (`tests/scenarios.qnt`): 32 hand-written interleavings
    (contention, delete-window, shadow hand-off, multi-key, LC5/LC7 CAS-failure
    cleanup, LC abort handoff / LC9-window overlap / D8 version-silent drift),
-   17 of which also assert `inv` in their final state. A separate
-   `tests/scenarios_2bin.qnt` (3 runs) re-instantiates the protocol at
-   `numBins = 2` to exercise cross-bin isolation, which is vacuous at 1 bin.
+   17 of which also assert `inv` in their final state. Plus the 12 resize
+   scenarios (`tests/scenarios_resize.qnt`, above). The former
+   `tests/scenarios_2bin.qnt` is retired: A′'s gen-0 always has exactly one
+   bin, so its cross-bin coverage re-landed post-resize (between gen-1's bins
+   2/3, scenario `resize_cross_bin_isolated`) where it is strictly stronger.
 
 ## What is NOT proved
 
@@ -86,11 +149,16 @@ Key abstractions:
   reads, and the seqlock's plain-load arguments live in `design.md` and are
   exercised empirically by the Porcupine linearizability tests (run **without**
   `-race` — see the repo's `tests/`).
-- **Domain sizes**: 1 bin, 3 slots, ≤ 2 procs, ≤ 2 keys, 2 values. Bugs that
-  need larger instances escape (standard small-scope hypothesis). A 2-bin
-  config exists (`verify/invariants_2proc_2key_2bin.qnt`) but only at the
-  simulator + scenarios tiers — induction still runs at 1 bin.
-- **Resize**: unmodeled until the next phase.
+- **Domain sizes**: ≤ 2 resizes (`maxGen ≤ 2`, 7 bins max), 2–3 slots per
+  bin, ≤ 2 procs, ≤ 2 keys, 2 values. Bugs that need larger instances escape
+  (standard small-scope hypothesis).
+- **Resize, beyond the 1a tier**: the resize machinery is checked by
+  scenarios + simulator + base cases only. Consecution (inductive `inv` over
+  the composed system, `rsInv` anchor wiring) is stage 1b; anchored
+  refinement over resize — the transfer-correctness theorem (`rsDone` is an
+  abstract no-op) — is stage 1c. The Phase 0 inductive + anchored-refinement
+  results continue to hold on the maxGen=0 configs, re-verified after the
+  retyping.
 - **Insert's keep-slot retry path**: on finalize failure, the Go implementation
   (`allocator/insert.go:102–153`, `retryWithSlot`) KEEPS its `Trying`
   reservation, re-scans under a fresh header `h2`, and re-finalizes with `h2`
@@ -155,6 +223,12 @@ Apalache consecution grows steeply with the config. `verify.sh` tiers it:
 | 2-proc consecution | ~45 min – 2.8 h | `DLHT_VERIFY_2PROC=1` (default on) |
 | 2-proc anchored refinement | ~21 min | `DLHT_VERIFY_2PROC=1` (default on) |
 | 2-proc-2-key consecution | ~23 min (idle, 16 GB heap) | `DLHT_VERIFY_2KEY=1` (default **off**) |
+| resize 1gen simulator (inv + rsInv, depth 40) | seconds–minutes | always |
+| resize 2gen simulator pair | seconds–minutes | `DLHT_VERIFY_2GEN=1` (default **off**) |
+
+The resize configs participate in the **simulator + scenario + base-case
+tiers only** so far (the 1a bar); their consecution/refinement stages land
+with 1b/1c.
 
 Times vary widely with machine load (Apalache is SMT-bound; a 16 GB JVM heap is
 set in `verify.sh` — an earlier 2-key attempt on a loaded machine with the
@@ -183,8 +257,15 @@ scenarios: quint's default test selection only runs `run` definitions whose
 *name* matches a "test" pattern, and the scenarios are descriptively named.
 `verify.sh` uses `--match '_.*_'` (selects exactly the snake_case scenario runs,
 excludes the single-underscore `unchanged_*` protocol actions) and asserts the
-exact counts (`32 passing`, and `3 passing` for `tests/scenarios_2bin.qnt`) so
-coverage cannot silently shrink.
+exact counts (`32 passing`, and `12 passing` for `tests/scenarios_resize.qnt`)
+so coverage cannot silently shrink.
+
+Two more, learned in stage 1a: Apalache requires **constant integer bounds**
+in `a.to(b)` and does not constant-fold `ApaFoldSet` — hence `pow2` is a
+closed-form if-chain, not a range fold. And the Rust evaluator resolves a
+`nondet x = S.oneOf()` **against the action's guards** (it searches for a
+satisfying choice), which is what makes the daemon's nondet bin picks usable
+in directed `.then(...)` chains.
 
 ## Toolchain
 

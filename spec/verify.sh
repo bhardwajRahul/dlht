@@ -35,8 +35,12 @@ export JVM_ARGS="${JVM_ARGS:--Xmx16384m}"
 #   DLHT_VERIFY_2PROC=1  (default ON)  2-proc base+consecution+refinement+corollaries
 #   DLHT_VERIFY_2KEY=0   (default OFF) 2-proc-2-key base+consecution — must
 #                        pass when enabled; run it before claiming full assurance.
+#   DLHT_VERIFY_2GEN=0   (default OFF) maxGen=2 resize tier (double-resize /
+#                        laggard chain-walk) in the simulator stage — must
+#                        pass when enabled.
 DLHT_VERIFY_2PROC="${DLHT_VERIFY_2PROC:-1}"
 DLHT_VERIFY_2KEY="${DLHT_VERIFY_2KEY:-0}"
+DLHT_VERIFY_2GEN="${DLHT_VERIFY_2GEN:-0}"
 
 # Simulator depths are MINIMUMS, not suggestions: shallow runs never reach the
 # deep action paths and would green-wash this stage. Do not lower them.
@@ -50,7 +54,7 @@ REFINE_INIT_STEPS_2PROC="${REFINE_INIT_STEPS_2PROC:-6}"
 # Number of scenario run-definitions expected (snake_case names; --match '_.*_'
 # selects exactly these and excludes the single-underscore unchanged_* actions).
 SCENARIO_COUNT="${SCENARIO_COUNT:-32}"
-SCENARIO_2BIN_COUNT="${SCENARIO_2BIN_COUNT:-3}"
+SCENARIO_RESIZE_COUNT="${SCENARIO_RESIZE_COUNT:-12}"
 
 # quint's client and the Apalache server occasionally deadlock in their gRPC
 # handshake at spawn (observed repeatedly: both processes ~0% CPU forever, the
@@ -107,21 +111,31 @@ verify() {
 
 echo "=== 1. Type checking ==="
 for m in types.qnt protocol.qnt invariants.qnt induction.qnt checked.qnt \
-         common.qnt augmentation.qnt refinement.qnt \
+         common.qnt augmentation.qnt refinement.qnt resize.qnt system.qnt \
          verify/invariants_1proc.qnt verify/invariants_2proc.qnt verify/invariants_2proc_2key.qnt \
-         verify/invariants_2proc_2key_2bin.qnt \
          verify/induction_1proc.qnt verify/induction_2proc.qnt verify/induction_2proc_2key.qnt \
          verify/refinement_1proc.qnt verify/refinement_2proc.qnt \
          verify/refinement_anchored_1proc.qnt verify/refinement_anchored_2proc.qnt \
-         tests/scenarios.qnt tests/scenarios_2bin.qnt; do
+         verify/system_resize_1gen.qnt verify/system_resize_2gen.qnt \
+         tests/scenarios.qnt tests/scenarios_resize.qnt; do
   quint typecheck "$m"
 done
 
 echo "=== 2. Simulator: random traces (typeOK + inv) ==="
-for cfg in invariants_1proc invariants_2proc invariants_2proc_2key invariants_2proc_2key_2bin; do
+for cfg in invariants_1proc invariants_2proc invariants_2proc_2key; do
   quint run "verify/$cfg.qnt" --invariant=typeOK --max-steps="$RUN_MAX_STEPS" --max-samples="$RUN_MAX_SAMPLES"
   quint run "verify/$cfg.qnt" --invariant=inv --max-steps="$RUN_MAX_STEPS" --max-samples="$RUN_MAX_SAMPLES"
 done
+# Resize tier: depth 40 so traces complete >=1 full transfer cycle (~7 daemon
+# steps: trigger/begin/sentinel/move x slots/done/finalize) amid op traffic.
+quint run verify/system_resize_1gen.qnt --invariant=invariant_inv --max-steps=40 --max-samples="$RUN_MAX_SAMPLES"
+quint run verify/system_resize_1gen.qnt --invariant=invariant_rsInv --max-steps=40 --max-samples="$RUN_MAX_SAMPLES"
+if [[ "$DLHT_VERIFY_2GEN" == "1" ]]; then
+  quint run verify/system_resize_2gen.qnt --invariant=invariant_inv --max-steps=40 --max-samples="$RUN_MAX_SAMPLES"
+  quint run verify/system_resize_2gen.qnt --invariant=invariant_rsInv --max-steps=40 --max-samples="$RUN_MAX_SAMPLES"
+else
+  echo "  [2gen resize simulator] SKIPPED (DLHT_VERIFY_2GEN=0)"
+fi
 
 echo "=== 3. Anchor smoke (a satisfying inv-state exists) ==="
 verify verify/induction_1proc.qnt --invariant=smoke --max-steps=0
@@ -149,6 +163,19 @@ if [[ "$DLHT_VERIFY_2KEY" == "1" ]]; then
   verify verify/induction_2proc_2key.qnt --invariant=inv --max-steps=1
 else
   echo "  [2-proc-2-key] SKIPPED (DLHT_VERIFY_2KEY=0; run with =1 for full assurance)"
+fi
+# Resize-config BASE cases (1a tier; ~60-75s each). Consecution over the
+# resize machinery is stage 1b's job (system anchor + rsInv inductive
+# wiring) — 1a deliberately makes NO consecution claims; placeholder only.
+echo "  [resize 1gen] base cases (inv, rsInv)"
+verify verify/system_resize_1gen.qnt --invariant=invariant_inv --max-steps=0
+verify verify/system_resize_1gen.qnt --invariant=invariant_rsInv --max-steps=0
+if [[ "$DLHT_VERIFY_2GEN" == "1" ]]; then
+  echo "  [resize 2gen] base cases (inv, rsInv)"
+  verify verify/system_resize_2gen.qnt --invariant=invariant_inv --max-steps=0
+  verify verify/system_resize_2gen.qnt --invariant=invariant_rsInv --max-steps=0
+else
+  echo "  [resize 2gen base cases] SKIPPED (DLHT_VERIFY_2GEN=0)"
 fi
 
 echo "=== 5. Refinement: anchored (depth-independent) ==="
@@ -189,19 +216,20 @@ if ! echo "$scen_out" | grep -qE "(^| )${SCENARIO_COUNT} passing"; then
 fi
 echo "  ${SCENARIO_COUNT} scenarios passed."
 
-# Cross-bin tier (numBins=2): same fail-closed pattern, separate count.
-scen2_out="$(quint test tests/scenarios_2bin.qnt --match '_.*_' --max-samples="$RUN_MAX_SAMPLES" 2>&1)" || true
-echo "$scen2_out" | grep -E "[0-9]+ passing|[0-9]+ failed" || true
-if echo "$scen2_out" | grep -qE "[0-9]+ failed"; then
-  echo "FATAL: 2-bin scenario test failure." >&2
-  echo "$scen2_out" | grep -A2 -E "[0-9]+\)" >&2 || true
+# Resize tier (system composition, 1gen + 2gen instances): same fail-closed
+# pattern, separate count.
+scenr_out="$(quint test tests/scenarios_resize.qnt --match '_.*_' --max-samples="$RUN_MAX_SAMPLES" 2>&1)" || true
+echo "$scenr_out" | grep -E "[0-9]+ passing|[0-9]+ failed" || true
+if echo "$scenr_out" | grep -qE "[0-9]+ failed"; then
+  echo "FATAL: resize scenario test failure." >&2
+  echo "$scenr_out" | grep -A2 -E "[0-9]+\)" >&2 || true
   exit 1
 fi
-if ! echo "$scen2_out" | grep -qE "(^| )${SCENARIO_2BIN_COUNT} passing"; then
-  echo "FATAL: expected exactly ${SCENARIO_2BIN_COUNT} 2-bin scenarios to run/pass (--match '_.*_')." >&2
-  echo "Got: $(echo "$scen2_out" | grep -E "passing" || echo "no passing line")" >&2
+if ! echo "$scenr_out" | grep -qE "(^| )${SCENARIO_RESIZE_COUNT} passing"; then
+  echo "FATAL: expected exactly ${SCENARIO_RESIZE_COUNT} resize scenarios to run/pass (--match '_.*_')." >&2
+  echo "Got: $(echo "$scenr_out" | grep -E "passing" || echo "no passing line")" >&2
   exit 1
 fi
-echo "  ${SCENARIO_2BIN_COUNT} 2-bin scenarios passed."
+echo "  ${SCENARIO_RESIZE_COUNT} resize scenarios passed."
 
 echo "All checks passed."

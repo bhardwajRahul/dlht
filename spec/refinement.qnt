@@ -21,8 +21,8 @@ module refinement {
   var preArg: PROC -> Option[Arg]
   var preRet: PROC -> Option[Res]
   var preHeader: BinIdx -> Header
-  var preSlotKey: BinIdx -> (SlotIdx -> Option[KEY])
-  var preSlotVal: BinIdx -> (SlotIdx -> Option[VAL])
+  var preSlotKey: BinIdx -> (SlotIdx -> Option[HashKey])
+  var preSlotVal: BinIdx -> (SlotIdx -> Option[Entry])
   var preSlotTag: BinIdx -> (SlotIdx -> Option[int])
 
   const refineBound: int
@@ -30,23 +30,42 @@ module refinement {
   pure def witnessResFrom(opMap: PROC -> Op, retMap: PROC -> Option[Res]): PROC -> Option[Res] =
     procSet.mapBy(p => if (opMap.get(p) != None and retMap.get(p) != None) retMap.get(p) else None)
 
-  pure def concreteStateFrom(headerMap: BinIdx -> Header, keyMap: BinIdx -> (SlotIdx -> Option[KEY]),
-      valMap: BinIdx -> (SlotIdx -> Option[VAL]), tagMap: BinIdx -> (SlotIdx -> Option[int])): State =
-    keyDomain.mapBy(k => readVisibleByHeaderFrom(headerMap.get(binOf(k)), keyMap, valMap, tagMap, binOf(k), k))
+  // The authoritative generation for key k (design §6): the LEAST g whose
+  // bin for k is not DoneTransfer — well-defined because gens < activeGen
+  // are all Done and future gens pristine. An EXPLICIT ordered chain, not a
+  // set fold: Quint set folds visit in unspecified order, and the chain is
+  // exact for maxGen <= 2 (protocol's maxGenCap assume; design D3). The
+  // `maxGen >= 1 and` conjunct short-circuits the gen-1 bin read on
+  // maxGen=0 configs, where bins 2..3 are out of the bin domain.
+  pure def authoritativeGen(headerMap: BinIdx -> Header, k: KEY): GenIdx =
+    if (headerMap.get(binFor(k, 0)).binState != DoneTransfer) 0
+    else if (maxGen >= 1 and headerMap.get(binFor(k, 1)).binState != DoneTransfer) 1
+    else 2  // unreachable below maxGen = 2: a maxGen-gen bin is never Done
 
-  pure def witnessSetFrom(headerMap: BinIdx -> Header, keyMap: BinIdx -> (SlotIdx -> Option[KEY]),
-      valMap: BinIdx -> (SlotIdx -> Option[VAL]), tagMap: BinIdx -> (SlotIdx -> Option[int]),
+  // Entry-key visibility doesn't read slotKey (design §6), so the
+  // abstraction takes no keyMap. The pre/post slotKey snapshots remain in the
+  // frame for stage 1c's transfer-correctness work. Each key is read at its
+  // authoritative generation; daemon steps must be abstract no-ops there.
+  pure def concreteStateFrom(headerMap: BinIdx -> Header,
+      valMap: BinIdx -> (SlotIdx -> Option[Entry]), tagMap: BinIdx -> (SlotIdx -> Option[int])): State =
+    keyDomain.mapBy(k => {
+      val g = authoritativeGen(headerMap, k)
+      readVisibleByHeaderFrom(headerMap.get(binFor(k, g)), valMap, tagMap, binFor(k, g), k)
+    })
+
+  pure def witnessSetFrom(headerMap: BinIdx -> Header,
+      valMap: BinIdx -> (SlotIdx -> Option[Entry]), tagMap: BinIdx -> (SlotIdx -> Option[int]),
       opMap: PROC -> Op, argMap: PROC -> Option[Arg], retMap: PROC -> Option[Res]): Set[Config] =
     Set({
-      state: concreteStateFrom(headerMap, keyMap, valMap, tagMap),
+      state: concreteStateFrom(headerMap, valMap, tagMap),
       op: opMap,
       arg: argMap,
       res: witnessResFrom(opMap, retMap),
     })
 
-  def sPre = witnessSetFrom(preHeader, preSlotKey, preSlotVal, preSlotTag, preOp, preArg, preRet)
+  def sPre = witnessSetFrom(preHeader, preSlotVal, preSlotTag, preOp, preArg, preRet)
 
-  def sPost = witnessSetFrom(header, slotKey, slotVal, slotTag, op, arg, ret)
+  def sPost = witnessSetFrom(header, slotVal, slotTag, op, arg, ret)
 
   def invokingProcsNow = procSet.filter(p => preOp.get(p) == None and op.get(p) != None)
 
