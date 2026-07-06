@@ -94,25 +94,38 @@ module resize {
   // deleted-skip case uses if/else with IDENTICAL update sets in both
   // branches (the effect checker rejects mismatched update sets).
   //
-  // 1b WIRE-ORDER NOTE (review finding): cs forces header.get(cb) with
-  // cb = binFor(e.k, genOfBin(b)+1), out-of-domain for a LAST-generation b.
-  // Reachably safe (snapshot present ⟹ the bin began transfer ⟹
-  // genOfBin(b) < maxGen), but once stage 1b folds snapshot/cursor into the
-  // induction anchor, a fabricated `snapshot(b) != None` on a maxGen bin
-  // reproduces the unconstrained-read hazard inside rsMove/rsShadowCarry/
-  // rsSentinel consecution. The anchor guard must include rsInv (R6 + R1 +
-  // typeOK imply the needed fact) BEFORE any consecution over daemon steps.
+  // LAST-GENERATION DOMAIN GUARD (made STRUCTURAL — 1b review finding).
+  // This is a TOTALITY / ENCODING-CORRECTNESS fix, not optional proof
+  // plumbing: it expresses the real protocol fact "there is no transfer out
+  // of the last generation" (rsTrigger requires activeGen < maxGen) and keeps
+  // the model well-defined under Apalache's eager out-of-domain map semantics.
+  // cb = binFor(_, genOfBin(b)+1) is OUT of binDomain for a maxGen bin, and
+  // Apalache translates every expression (incl. the child header.get/.set)
+  // regardless of guard truth. For an ENABLED rsMove the bin is InTransfer,
+  // and genTopology (in invPure, hence in the 1b anchor) forces an InTransfer
+  // bin into a gen < maxGen — so enabled ⟹ genOfBin(b) < maxGen and cb is
+  // in-domain. But that is a property of genTopology + the InTransfer guard,
+  // NOT of rsInv: an earlier draft of this note wrongly cited R6, whose
+  // Some-arm is a DISJUNCTION that permits a stale NoTransfer snapshot on a
+  // maxGen bin — so R6 does not exclude the fabricated pre-state. We therefore
+  // make the safety STRUCTURAL rather than guard-order-dependent: `safeChild`
+  // routes cb to an in-domain dummy (b) when no child generation exists, and
+  // the explicit `genOfBin(b) < maxGen` guard conjunct documents that you
+  // cannot transfer out of the last generation. Both are inert for every
+  // reachable (enabled) rsMove.
   action rsMove = {
     nondet b = binDomain.oneOf()
     val snap = match snapshot.get(b) { | Some(sn) => sn | None => emptyHeader }
     val s = nextSlot(snap, cursor.get(b))
     val entryOpt = if (s == 0) None else slotVal.get(b).get(s)
     val e = match entryOpt { | Some(x) => x | None => { k: anyKey, v: anyVal } }  // dummy unused when None
-    val cb = binFor(e.k, genOfBin(b) + 1)
-    val cs = if (entryOpt == None) 0
+    val safeChild = genOfBin(b) < maxGen
+    val cb = if (safeChild) binFor(e.k, genOfBin(b) + 1) else b   // in-domain dummy when no child
+    val cs = if (entryOpt == None or not(safeChild)) 0
              else minOr0(slotIdx.filter(t => header.get(cb).slotState.get(t) == Invalid))
     all {
       header.get(b).binState == InTransfer,
+      genOfBin(b) < maxGen,        // cannot transfer out of the last generation
       snapshot.get(b) != None,
       s != 0,
       snap.slotState.get(s) == Valid,
@@ -152,11 +165,16 @@ module resize {
       | Some(hk) => match hk { | HKey(kk) => kk | HSentinel => anyKey }
       | None => anyKey
     }
-    val cb = binFor(k, genOfBin(b) + 1)
-    val cs = if (not(isHKey)) 0
+    // LAST-GENERATION DOMAIN GUARD — see rsMove's note (structural, not
+    // guard-order-dependent: enabled ⟹ genOfBin(b) < maxGen via genTopology,
+    // and safeChild keeps the child read in-domain on disabled tries).
+    val safeChild = genOfBin(b) < maxGen
+    val cb = if (safeChild) binFor(k, genOfBin(b) + 1) else b
+    val cs = if (not(isHKey) or not(safeChild)) 0
              else minOr0(slotIdx.filter(t => header.get(cb).slotState.get(t) == Invalid))
     all {
       header.get(b).binState == InTransfer,
+      genOfBin(b) < maxGen,        // cannot transfer out of the last generation
       snapshot.get(b) != None,
       s != 0,
       snap.slotState.get(s) == Shadow,

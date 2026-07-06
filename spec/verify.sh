@@ -30,15 +30,23 @@ export JVM_ARGS="${JVM_ARGS:--Xmx16384m}"
 
 # Cost tiers. Apalache consecution is expensive and grows fast with the config:
 # 1-proc ~1.5-9min, 2-proc ~45min-2.8h, 2-proc-2-key ~23min-hours (load- and
-# heap-dependent). The 1-proc checks always run; 2-proc is DEFAULT-ON (set
-# DLHT_VERIFY_2PROC=0 for a fast smoke); only the 2-key tier is opt-in.
-#   DLHT_VERIFY_2PROC=1  (default ON)  2-proc base+consecution+refinement+corollaries
-#   DLHT_VERIFY_2KEY=0   (default OFF) 2-proc-2-key base+consecution — must
-#                        pass when enabled; run it before claiming full assurance.
-#   DLHT_VERIFY_2GEN=0   (default OFF) maxGen=2 resize tier (double-resize /
-#                        laggard chain-walk) in the simulator stage — must
-#                        pass when enabled.
+# heap-dependent). The maxGen=0 1-proc checks always run; 2-proc is DEFAULT-ON
+# (set DLHT_VERIFY_2PROC=0 for a faster run); the 2-key and 2gen tiers are opt-in.
+# Resize (stage 1b) adds the system-anchor consecution of inv ∧ rsInv (proved
+# INDUCTIVE over systemStep): observed 1gen 1-proc ~50min, 1gen 2-proc ~5h, 2gen
+# biggest. The 1-proc resize consecution is default-on but flag-gated so a TRUE
+# fast smoke (2PROC=0 RESIZE_1P=0) skips all multi-minute consecution.
+#   DLHT_VERIFY_2PROC=1     (default ON)  2-proc base+consecution+refinement+corollaries
+#                           + resize 1gen 2-proc consecution (~5h)
+#   DLHT_VERIFY_RESIZE_1P=1 (default ON)  resize 1gen 1-proc consecution (~50min);
+#                           set =0 (with 2PROC=0) for a true fast smoke
+#   DLHT_VERIFY_2KEY=0      (default OFF) 2-proc-2-key base+consecution — must
+#                           pass when enabled; run it before claiming full assurance.
+#   DLHT_VERIFY_2GEN=0      (default OFF) maxGen=2 resize tier (double-resize /
+#                           laggard chain-walk): simulator + base + 2-proc
+#                           consecution — must pass when enabled.
 DLHT_VERIFY_2PROC="${DLHT_VERIFY_2PROC:-1}"
+DLHT_VERIFY_RESIZE_1P="${DLHT_VERIFY_RESIZE_1P:-1}"
 DLHT_VERIFY_2KEY="${DLHT_VERIFY_2KEY:-0}"
 DLHT_VERIFY_2GEN="${DLHT_VERIFY_2GEN:-0}"
 
@@ -112,11 +120,14 @@ verify() {
 echo "=== 1. Type checking ==="
 for m in types.qnt protocol.qnt invariants.qnt induction.qnt checked.qnt \
          common.qnt augmentation.qnt refinement.qnt resize.qnt system.qnt \
+         system_induction.qnt \
          verify/invariants_1proc.qnt verify/invariants_2proc.qnt verify/invariants_2proc_2key.qnt \
          verify/induction_1proc.qnt verify/induction_2proc.qnt verify/induction_2proc_2key.qnt \
          verify/refinement_1proc.qnt verify/refinement_2proc.qnt \
          verify/refinement_anchored_1proc.qnt verify/refinement_anchored_2proc.qnt \
          verify/system_resize_1gen.qnt verify/system_resize_2gen.qnt \
+         verify/induction_resize_1gen_1proc.qnt verify/induction_resize_1gen_2proc.qnt \
+         verify/induction_resize_2gen_2proc.qnt \
          tests/scenarios.qnt tests/scenarios_resize.qnt; do
   quint typecheck "$m"
 done
@@ -164,18 +175,38 @@ if [[ "$DLHT_VERIFY_2KEY" == "1" ]]; then
 else
   echo "  [2-proc-2-key] SKIPPED (DLHT_VERIFY_2KEY=0; run with =1 for full assurance)"
 fi
-# Resize-config BASE cases (1a tier; ~60-75s each). Consecution over the
-# resize machinery is stage 1b's job (system anchor + rsInv inductive
-# wiring) — 1a deliberately makes NO consecution claims; placeholder only.
+# Resize-config consecution tier (stage 1b): inv ∧ rsInv proved INDUCTIVE over
+# systemStep (protocol ∨ daemon) from the system anchor (system_induction.qnt).
+# 1a made NO consecution claims here; 1b does. Base cases (~60-75s each) always
+# run; the consecutions are tiered by cost (see the cost-tier block above). A
+# [violation] aborts via set -e (fail-closed). If a 2-proc/2gen monolithic goal
+# proves intractable, the design-sanctioned fallback is per-family consecution
+# (loop the g_<family> localizers under the same anchor) — recorded here if used.
 echo "  [resize 1gen] base cases (inv, rsInv)"
 verify verify/system_resize_1gen.qnt --invariant=invariant_inv --max-steps=0
 verify verify/system_resize_1gen.qnt --invariant=invariant_rsInv --max-steps=0
+echo "  [resize 1gen 1-proc] anchor smoke (systemIndInit is satisfiable)"
+verify verify/induction_resize_1gen_1proc.qnt --invariant=smoke --max-steps=0
+if [[ "$DLHT_VERIFY_RESIZE_1P" == "1" ]]; then
+  echo "  [resize 1gen 1-proc] consecution (~50min)"
+  verify verify/induction_resize_1gen_1proc.qnt --invariant=inv --max-steps=1
+else
+  echo "  [resize 1gen 1-proc consecution] SKIPPED (DLHT_VERIFY_RESIZE_1P=0)"
+fi
+if [[ "$DLHT_VERIFY_2PROC" == "1" ]]; then
+  echo "  [resize 1gen 2-proc] consecution (~5h)"
+  verify verify/induction_resize_1gen_2proc.qnt --invariant=inv --max-steps=1
+else
+  echo "  [resize 1gen 2-proc consecution] SKIPPED (DLHT_VERIFY_2PROC=0)"
+fi
 if [[ "$DLHT_VERIFY_2GEN" == "1" ]]; then
   echo "  [resize 2gen] base cases (inv, rsInv)"
   verify verify/system_resize_2gen.qnt --invariant=invariant_inv --max-steps=0
   verify verify/system_resize_2gen.qnt --invariant=invariant_rsInv --max-steps=0
+  echo "  [resize 2gen 2-proc] consecution (gated, biggest)"
+  verify verify/induction_resize_2gen_2proc.qnt --invariant=inv --max-steps=1
 else
-  echo "  [resize 2gen base cases] SKIPPED (DLHT_VERIFY_2GEN=0)"
+  echo "  [resize 2gen base cases + consecution] SKIPPED (DLHT_VERIFY_2GEN=0)"
 fi
 
 echo "=== 5. Refinement: anchored (depth-independent) ==="

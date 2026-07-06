@@ -406,7 +406,10 @@ module protocol {
         local' = local.set(p, withGen(local.get(p), g + 1)),
         pc' = pc.set(p, PcG1),
       } else all {
-        // InTransfer: back off, reload m.active (may jump several gens)
+        // InTransfer: back off, reload m.active. (In Go this may jump several
+        // gens; in-model genTopology pins an InTransfer bin's gen == activeGen,
+        // so this is effectively a self-assignment — the multi-gen catch-up is
+        // reproduced by the successive DoneTransfer chain-walks above.)
         local' = local.set(p, withGen(local.get(p), activeGen)),
         pc' = pc.set(p, PcG1),
       },
@@ -1303,7 +1306,7 @@ module protocol {
           // the visible set, which is exactly the abstract precondition for the
           // "absent, fn ran, not saved" outcome. (Mirrors the save=true commit
           // above, which also linearizes at LC7.) LC9 is then pure cleanup.
-          // The Shadow -> Trying flip keeps the slot invisible to L3/I2.5 scans,
+          // The Shadow -> Trying flip keeps the slot invisible to LC2/I2 scans,
           // so LC9 can clear slot.Val without exposing a Shadow-with-nil-entry
           // window to other LoadOrComputes.
           all {
@@ -1376,7 +1379,7 @@ module protocol {
   // Invalid, clear op (the return). The result was already posted to ret at
   // LC7 (the linearization point), so LC9 does NOT touch ret. The slot
   // transitioned Shadow -> Trying at LC7; while Trying it's invisible to
-  // L3/I2.5 scans, so clearing the entry pointer here cannot be observed.
+  // LC2/I2 scans, so clearing the entry pointer here cannot be observed.
   action LC9(p) = {
     val k = keyOfProc(p)
     val b = binFor(k, local.get(p).gen)

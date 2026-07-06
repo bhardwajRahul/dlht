@@ -99,26 +99,42 @@ stage-1a evidence tier is described below.
    Every family carries a `//` comment naming the protocol mechanism that
    guarantees it — `inv` *is* the protocol's written, machine-checked proof.
 
-1b. **Resize evidence tier (stage 1a)** — for the resize machinery the
-   current bar is *scenarios + simulator + base cases*, deliberately **below**
-   the inductive bar (stage 1b lands consecution over the resize state;
-   stage 1c the refinement/transfer-correctness theorem):
-   - Simulator `[ok]` for `inv` AND `rsInv` (the daemon-state families
-     R6–R12, wrapped in `system.qnt`) on `system_resize_1gen` at depths
-     completing ≥1 full transfer cycle; the `system_resize_2gen` pair under
-     `DLHT_VERIFY_2GEN=1` (must pass when enabled).
-   - Base cases `[ok]` on both system configs (wired into verify.sh stage 4).
-   - Twelve directed resize scenarios (`tests/scenarios_resize.qnt`): the
-     sentinel cut from both sides (pre-sentinel Put carried / post-sentinel
-     Put redirected), the delete window carried as absent + the straggler D8
-     on a dead header, insert abandon-and-redirect in both orders
-     (reserve+fill pre-OR, and the design-§8 fill-AFTER-OR where I4's
-     unguarded write lands mid-transfer), LC relocation (commit + abort),
-     the snapStateAgrees resurrection interleaving, cross-bin isolation
-     post-resize, and — on the 2gen instance — the laggard double-walk and
-     the holder double-relocation.
-   **No consecution claims are made over the resize machinery yet**; the
-   R-families are reachable-true tier.
+1b. **Resize consecution (stage 1b) — `inv ∧ rsInv` INDUCTIVE.** `inv ∧ rsInv`
+   is proved **inductive over `systemStep`** (protocol ∨ resize daemon) at
+   **1-proc AND 2-proc** on `resize_1gen` (maxGen=1), via the system anchor
+   `system_induction.qnt::systemIndInit` — which constructs an arbitrary state
+   satisfying `invPure ∧ rsInvPure` *including* the daemon vars
+   `snapshot`/`cursor` (the part 1a's anchor deliberately omitted); a per-family
+   `g_<family>` harness localizes counterexamples, and a parallel runner
+   (`consecution_sweep.sh`, one Apalache server per group via `--server-endpoint`)
+   discharges the 2-proc goal group-by-group. The daemon-state families in
+   `rsInvPure` (`rsSnapshotRelation` … `carriedClaimExists`, parameterized over
+   snapshot/cursor and wrapped in `system.qnt`) are now **inductive conjuncts**,
+   not merely reachable-true.
+   - The 2-proc run surfaced and **closed a genuine inductiveness gap**:
+     `shadowOwnedUnique` was non-inductive because `ownsShadowIn`'s carried-claim
+     arm keys on key + gen-chain alone (not on the slot being a *live* Shadow),
+     so the anchor could fabricate a dead-bin holder whose carried Shadow is
+     absent and the arm latched onto another proc's same-key Trying reservation /
+     Invalid stale-key slot (two counterexamples). **R23 `carriedClaimExists`**
+     — a holder past a `DoneTransfer` own-gen bin *possesses* its carried child
+     Shadow (true because `rsDone` only completes after `rsShadowCarry` copied
+     every snapshot Shadow, per `rsCompleteness`) — makes it inductive. Diagnosis
+     and fix independently confirmed by Codex + Opus reviews. The
+     transfer-completeness negative control (neutralize `rsCompleteness` ⇒
+     `[violation]`) confirms that family is load-bearing.
+   - `resize_2gen` (maxGen=2) consecution exists and is gated under
+     `DLHT_VERIFY_2GEN` (must pass when enabled).
+   - Reachable-true backing remains: the simulator (`inv`+`rsInv` on both system
+     configs, depth ≥1 full transfer cycle), base cases (verify.sh stage 4), and
+     12 directed resize scenarios (`tests/scenarios_resize.qnt`): the sentinel
+     cut from both sides, the delete window carried as absent + the straggler D8
+     on a dead header, insert abandon-and-redirect in both orders, LC relocation
+     (commit + abort), the snapStateAgrees resurrection interleaving, cross-bin
+     isolation post-resize, and — on 2gen — the laggard double-walk and the
+     holder double-relocation.
+   Stage 1c (refinement / transfer-correctness — `rsDone` as an abstract no-op)
+   remains future.
 
 2. **Step refinement against the atomic map** (`refinement.qnt` vs
    `types.qnt::deltaResult`). The abstraction function reads each key's visible
@@ -152,13 +168,13 @@ stage-1a evidence tier is described below.
 - **Domain sizes**: ≤ 2 resizes (`maxGen ≤ 2`, 7 bins max), 2–3 slots per
   bin, ≤ 2 procs, ≤ 2 keys, 2 values. Bugs that need larger instances escape
   (standard small-scope hypothesis).
-- **Resize, beyond the 1a tier**: the resize machinery is checked by
-  scenarios + simulator + base cases only. Consecution (inductive `inv` over
-  the composed system, `rsInv` anchor wiring) is stage 1b; anchored
-  refinement over resize — the transfer-correctness theorem (`rsDone` is an
-  abstract no-op) — is stage 1c. The Phase 0 inductive + anchored-refinement
-  results continue to hold on the maxGen=0 configs, re-verified after the
-  retyping.
+- **Resize, current bar (stage 1b done)**: `inv ∧ rsInv` is proved **inductive
+  over the composed system** at 1-proc and 2-proc on `resize_1gen` (anchor +
+  per-family sweep, above); `resize_2gen` consecution is gated. What remains is
+  stage **1c** — anchored refinement over resize, i.e. the transfer-correctness
+  theorem (`rsDone` is an abstract no-op). The Phase 0 inductive +
+  anchored-refinement results continue to hold on the maxGen=0 configs
+  (re-verified; `rsInvPure` additions are inert there by `genTopology`).
 - **Insert's keep-slot retry path**: on finalize failure, the Go implementation
   (`allocator/insert.go:102–153`, `retryWithSlot`) KEEPS its `Trying`
   reservation, re-scans under a fresh header `h2`, and re-finalizes with `h2`
@@ -171,6 +187,25 @@ stage-1a evidence tier is described below.
   cannot recreate a prior bit pattern without intervening bumps. Modeling it
   (new PCs I7/I8 + anchor/`allPCs`/space-table growth + full re-verification)
   is a candidate next work item.
+- **Entry pointer identity assumes GC no-reuse**: `slotTag`/`nextTag` model each
+  entry pointer as never reused — sound for Go (a parked op's captured `*Entry`
+  keeps the object reachable, so the allocator can't recycle it while a DWCAS
+  still holds it as an expectation), but a port to manual reclamation or a
+  recycling arena reintroduces pointer ABA the spec structurally cannot express.
+- **`rsMove`'s fresh child tag is a control-flow *condition***: the daemon places
+  transferred entries under a FRESH tag, over-approximating Go (which reuses the
+  same `*Entry`). Sound ONLY because no Go retry loop spans an index generation
+  (every DWCAS applies to the slot its expectation was read from); if a future
+  optimization lets a parked Put/Delete chase its entry into the child while
+  keeping the captured pointer, Go gains executions the spec excludes — re-verify.
+- **32-bit version wraparound**: `version` is an unbounded `Int` here, 32 bits in
+  Go. Every seqlock / ABA-freedom argument holds only modulo 2³² — a reader parked
+  across exactly k·2³² bumps of one bin could false-validate `h0 == h1`. Standard,
+  universally-accepted seqlock caveat.
+- **Hash collisions**: `slotKey = HKey(KEY)` makes the hash word injective per
+  key; two distinct keys with equal 64-bit maphash are inexpressible. Sound (Go
+  rests on the `candidate.Key == key` re-check + pointer DWCAS, both modeled), but
+  bin-level key↔hash collision interleavings are deliberately abstracted away.
 - **Liveness**: every check is safety; nothing is proved to terminate.
 
 ## Anchor completeness — the one thing to be paranoid about
@@ -226,9 +261,9 @@ Apalache consecution grows steeply with the config. `verify.sh` tiers it:
 | resize 1gen simulator (inv + rsInv, depth 40) | seconds–minutes | always |
 | resize 2gen simulator pair | seconds–minutes | `DLHT_VERIFY_2GEN=1` (default **off**) |
 
-The resize configs participate in the **simulator + scenario + base-case
-tiers only** so far (the 1a bar); their consecution/refinement stages land
-with 1b/1c.
+The resize configs now participate in the **consecution tier** too (stage 1b):
+`inv ∧ rsInv` inductive at 1-proc + 2-proc on `resize_1gen` (gated 2gen). Only
+the refinement/transfer-correctness stage (1c) is still future.
 
 Times vary widely with machine load (Apalache is SMT-bound; a 16 GB JVM heap is
 set in `verify.sh` — an earlier 2-key attempt on a loaded machine with the
