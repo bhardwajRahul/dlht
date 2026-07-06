@@ -67,19 +67,22 @@ func newConsistentValue(key string, iteration int) *ConsistentValue {
 	}
 }
 
-func mustUpsert[V any](t *rapid.T, m *dlht.Map[string, V], key string, val V, workerID, iter int) {
-	// Put fails on absent keys and subsequent Inserts can fail if another writer inserted first.
-	// A final Put handles that race without silently dropping this write.
+// mustUpsert publishes val under key. Put fails on absent keys and a
+// subsequent Insert can fail if another writer inserted first; a final Put
+// handles that race. Returns an error instead of failing the test because it
+// runs on worker goroutines (testing.T.Fatalf must stay on the test
+// goroutine).
+func mustUpsert[V any](m *dlht.Map[string, V], key string, val V, workerID, iter int) error {
 	if _, ok := m.Put(key, val); ok {
-		return
+		return nil
 	}
 	if _, ok := m.Insert(key, val); ok {
-		return
+		return nil
 	}
 	if _, ok := m.Put(key, val); ok {
-		return
+		return nil
 	}
-	t.Fatalf("writer failed to publish value key=%s worker=%d iter=%d", key, workerID, iter)
+	return fmt.Errorf("writer failed to publish value key=%s worker=%d iter=%d", key, workerID, iter)
 }
 
 func TestPBTDataIntegrityMagicValue(t *testing.T) {
@@ -105,6 +108,7 @@ func TestPBTDataIntegrityMagicValue(t *testing.T) {
 			readerKeys[i] = rapid.SliceOfN(rapid.IntRange(0, keyspace-1), opsPerWorker, opsPerWorker).Draw(t, fmt.Sprintf("readerKeys_%d", i))
 		}
 
+		errs := newErrSlots(writers + readers)
 		var wg sync.WaitGroup
 		for i := 0; i < writers; i++ {
 			wg.Add(1)
@@ -113,23 +117,30 @@ func TestPBTDataIntegrityMagicValue(t *testing.T) {
 				for j, idx := range indices {
 					key := keys[idx]
 					val := newMagicValue(workerID, j)
-					mustUpsert(t, m, key, val, workerID, j)
+					if err := mustUpsert(m, key, val, workerID, j); err != nil {
+						errs.set(workerID, err)
+						return
+					}
 				}
 			}(i, writerKeys[i])
 		}
 		for i := 0; i < readers; i++ {
 			wg.Add(1)
-			go func(indices []int) {
+			go func(readerID int, indices []int) {
 				defer wg.Done()
 				for _, idx := range indices {
 					key := keys[idx]
 					if v, ok := m.Get(key); ok && v != nil && !v.Validate() {
-						t.Fatalf("magic value corruption")
+						errs.set(writers+readerID, fmt.Errorf("magic value corruption: key=%s worker=%d iter=%d", key, v.WorkerID, v.Iteration))
+						return
 					}
 				}
-			}(readerKeys[i])
+			}(i, readerKeys[i])
 		}
 		wg.Wait()
+		if err := errs.first(); err != nil {
+			t.Fatalf("%v", err)
+		}
 	})
 }
 
@@ -156,6 +167,7 @@ func TestPBTDataIntegrityConsistentValue(t *testing.T) {
 			readerKeys[i] = rapid.SliceOfN(rapid.IntRange(0, keyspace-1), opsPerWorker, opsPerWorker).Draw(t, fmt.Sprintf("readerKeys_%d", i))
 		}
 
+		errs := newErrSlots(writers + readers)
 		var wg sync.WaitGroup
 		for i := 0; i < writers; i++ {
 			wg.Add(1)
@@ -164,22 +176,29 @@ func TestPBTDataIntegrityConsistentValue(t *testing.T) {
 				for j, idx := range indices {
 					key := keys[idx]
 					val := newConsistentValue(key, workerID*opsPerWorker+j)
-					mustUpsert(t, m, key, val, workerID, j)
+					if err := mustUpsert(m, key, val, workerID, j); err != nil {
+						errs.set(workerID, err)
+						return
+					}
 				}
 			}(i, writerKeys[i])
 		}
 		for i := 0; i < readers; i++ {
 			wg.Add(1)
-			go func(indices []int) {
+			go func(readerID int, indices []int) {
 				defer wg.Done()
 				for _, idx := range indices {
 					key := keys[idx]
 					if v, ok := m.Get(key); ok && v != nil && !v.Validate() {
-						t.Fatalf("consistent value corruption")
+						errs.set(writers+readerID, fmt.Errorf("consistent value corruption: key=%s iter=%d", v.Key, v.Iteration))
+						return
 					}
 				}
-			}(readerKeys[i])
+			}(i, readerKeys[i])
 		}
 		wg.Wait()
+		if err := errs.first(); err != nil {
+			t.Fatalf("%v", err)
+		}
 	})
 }

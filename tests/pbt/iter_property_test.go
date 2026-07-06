@@ -1,9 +1,11 @@
 package pbt
 
 import (
+	"fmt"
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jeremiah-masters/dlht"
@@ -176,6 +178,107 @@ func collectAllStrict(m *dlht.Map[string, int]) (map[string]int, int) {
 		out[k] = v
 	}
 	return out, dups
+}
+
+// Iterator exactly-once/at-most-once under delete/re-insert churn and
+// stacked resize generations. Stable keys must appear exactly once with
+// their exact value. The flood starts from InitialSize=1 so the scanShards
+// recursion crosses several generations (8x growth, 3 new hash bits per hop)
+// while iteration is in flight.
+//
+// The at-most-once check for churned keys is stronger than the documented
+// Range contract, which only promises exactly-once for keys present across
+// the whole call. It holds for the current emission structure: a key's hash
+// pins it to one old-index bin, and scanBin emits each bin either from its
+// snapshot or from its descendant shards, never both. This is the check that
+// catches a wrong shard formula in scanShards. If the emission strategy ever
+// changes on purpose, weaken it to stable keys only.
+func TestPBTRangeChurnResizeAtMostOnce(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		stableKeys := rapid.IntRange(50, 300).Draw(t, "stableKeys")
+		churnKeys := rapid.IntRange(1, 60).Draw(t, "churnKeys")
+		churners := rapid.IntRange(1, 3).Draw(t, "churners")
+		floodOps := rapid.IntRange(200, 900).Draw(t, "floodOps")
+		ranges := rapid.IntRange(3, 10).Draw(t, "ranges")
+		gomaxprocs := rapid.SampledFrom(gomaxprocsAxis()).Draw(t, "gomaxprocs")
+
+		defer setGOMAXPROCS(gomaxprocs)()
+
+		const churnBase = 1 << 16
+		const floodBase = 1 << 20
+		m := dlht.New[uint64, uint64](dlht.Options{InitialSize: 1})
+		for k := range stableKeys {
+			key := uint64(k)
+			if _, ok := m.Insert(key, key<<32|1); !ok {
+				t.Fatalf("stable Insert(%d) failed", key)
+			}
+		}
+
+		var stop atomic.Bool
+		var wg sync.WaitGroup
+		errs := newErrSlots(churners + 1)
+
+		for c := range churners {
+			wg.Add(1)
+			go func(c int) {
+				defer wg.Done()
+				seq := uint64(1)
+				for !stop.Load() {
+					k := churnBase + uint64((int(seq)+c)%churnKeys)
+					seq++
+					// Values stamped with their key; per-churner seqs need no
+					// global uniqueness because only the stamp is checked.
+					m.Insert(k, k<<32|seq)
+					m.Delete(k)
+				}
+			}(c)
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range floodOps {
+				k := floodBase + uint64(i)
+				if _, ok := m.Insert(k, k<<32|1); !ok {
+					errs.set(churners, fmt.Errorf("flood Insert(%d) failed", k))
+					return
+				}
+			}
+		}()
+
+		for r := range ranges {
+			seen := make(map[uint64]struct{})
+			stableSeen := 0
+			m.Range(func(k, v uint64) bool {
+				if _, dup := seen[k]; dup {
+					t.Errorf("range %d: key %d emitted twice in one call", r, k)
+				}
+				seen[k] = struct{}{}
+				// k and v come from the same immutable Entry, so this only
+				// catches torn or corrupt entries; the duplicate and
+				// stable-key checks do the real work here.
+				if v>>32 != k {
+					t.Errorf("range %d: key %d carries value %#x stamped for key %d", r, k, v, v>>32)
+				}
+				if k < uint64(stableKeys) {
+					stableSeen++
+					if v != k<<32|1 {
+						t.Errorf("range %d: stable key %d has value %#x, want %#x", r, k, v, k<<32|1)
+					}
+				}
+				return true
+			})
+			if stableSeen != stableKeys {
+				t.Errorf("range %d: saw %d stable keys, want %d", r, stableSeen, stableKeys)
+			}
+		}
+
+		stop.Store(true)
+		wg.Wait()
+		if err := errs.first(); err != nil {
+			t.Fatalf("%v", err)
+		}
+	})
 }
 
 // Concurrent Put writers vs Range: every (k, v) Range emits matches a value
