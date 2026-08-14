@@ -69,4 +69,5 @@ module induction_resize_1gen_1proc {
   def g_lc10AtDone = sysi::g_lc10AtDone
   def g_tryingOwnerUnique = sysi::g_tryingOwnerUnique
   def g_carriedClaimExists = sysi::g_carriedClaimExists
+  def g_rsEntryHome = sysi::g_rsEntryHome
 }

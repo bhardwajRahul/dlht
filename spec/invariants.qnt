@@ -1131,6 +1131,43 @@ module invariants {
           | None => true
         }))
 
+  // R24 (2gen consecution support — counterexample-driven, grp3 rsChildFreeSlot
+  // + grp4 rsChildKeyFresh): ENTRY placement. Every live entry sits in the bin
+  // its key hashes to FOR THAT BIN'S GENERATION:
+  //     slotVal[b][s] == Some(e)  ==>  binFor(e.k, genOfBin(b)) == b.
+  //
+  // This is the ENTRY (slotVal) analogue of hashConsistency, which pins only
+  // the slotKey WORD. The two diverge exactly at a sentineled slot: rsMove
+  // rewrites slotKey -> HSentinel but (deliberately, per R11's no-clear rule)
+  // does NOT clear slotVal, so a mid-transfer parent slot carries slotKey ==
+  // HSentinel while still holding its original entry. hashConsistency's HKey
+  // arm is then vacuous and NOTHING constrains that entry's key — so the anchor
+  // was free to fabricate a sentineled slot in bin b holding an entry whose key
+  // routes to a DIFFERENT bin. rsChildFreeSlot (R12b) and rsChildKeyFresh (R16)
+  // both route the pending entry by slotVal.k (they must — the slotKey is a
+  // sentinel), so a misrouted entry made them target the wrong child and fail:
+  // two gen-1 bins carrying the same key into one gen-2 child (grp4 collision),
+  // or a concurrent insert filling the child that a misrouted carry then needs
+  // (grp3 exhaustion). Both CEX pre-states park a live entry in a bin NO key
+  // hashes to (bin3, gen1-odd, in the k1->0/k2->2 configs) — impossible for a
+  // reachable slotVal.
+  //   Reachable-true because every slotVal WRITE is binFor-addressed: Insert /
+  // LC publish to binFor(k, local.gen) (== b, with genOfBin(b) == local.gen);
+  // rsMove / rsShadowCarry publish the child at binFor(k, genOfBin(parent)+1)
+  // (== cb, with genOfBin(cb) == genOfBin(parent)+1); Delete / abort clear to
+  // None (vacuous). No step writes an entry to a non-home bin, so this anchor
+  // conjunct is SELF-SUPPORTING (inductive with no new support lemma).
+  //   In rsInvPure, not invPure: at maxGen=0 there is one bin and binFor(_,0)
+  // == 1 for every key, so the clause is trivially true (Phase-0 inert), and
+  // the sentinel divergence that motivates it cannot occur without a resize.
+  pure def rsEntryHomePure(st: SpecState): bool =
+    binDomain.forall(b =>
+      slotIdx.forall(s =>
+        match st.slotVal.get(b).get(s) {
+          | Some(e) => binFor(e.k, genOfBin(b)) == b
+          | None => true
+        }))
+
   // R12: cross-generation claim continuity (§7.7, the PRECISE form): at most
   // one Shadow-k among NoTransfer bins (parent InTransfer exempt during the
   // carry window; dead parents exempt forever).
@@ -1266,7 +1303,8 @@ module invariants {
       shadowGhostFormPure(st) and
       lc10AtDonePure(st) and
       tryingOwnerUniquePure(st) and
-      carriedClaimExistsPure(st)
+      carriedClaimExistsPure(st) and
+      rsEntryHomePure(st)
 
   // (The live rsInv wrapper lives in system.qnt per the wiring rule — NOT
   // here.)

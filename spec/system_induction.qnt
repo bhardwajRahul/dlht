@@ -167,4 +167,5 @@ module system_induction {
   def g_lc10AtDone = lc10AtDonePure(currentSpecState)
   def g_tryingOwnerUnique = tryingOwnerUniquePure(currentSpecState)
   def g_carriedClaimExists = carriedClaimExistsPure(currentSpecState)
+  def g_rsEntryHome = rsEntryHomePure(currentSpecState)
 }

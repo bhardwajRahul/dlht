@@ -2,14 +2,14 @@
 # Parallel, memory-safe consecution sweep — the practical way to discharge the
 # system consecution gate (inv ∧ rsInv INDUCTIVE over systemStep) when the
 # monolithic `quint verify --invariant=inv --max-steps=1` is too slow (~15h at
-# 2-proc 1gen). Splits the 47 g_* family localizers into N groups, each checked
+# 2-proc 1gen). Splits the 48 g_* family localizers into N groups, each checked
 # concurrently as one `quint verify --invariants ...` on its OWN Apalache server
 # (--server-endpoint distinct port — the "one verify at a time" limit is only the
 # shared default port 8822).
 #
 # SOUNDNESS: every group runs from the SAME full anchor (init = systemIndInit =
-# invPure ∧ rsInvPure), and the 47 families are a complete, distinct partition of
-# inv ∧ rsInv (count==47 AND sort -u ==47 asserted below). So ALL groups [ok] is
+# invPure ∧ rsInvPure), and the 48 families are a complete, distinct partition of
+# inv ∧ rsInv (count==48 AND sort -u ==48 asserted below). So ALL groups [ok] is
 # equivalent to the monolithic consecution [ok]. (A SWEEP_FAMILIES SUBSET proves
 # ONLY those families, NOT the full gate — the OVERALL verdict says so.) Verdict is read from the
 # `[ok] No violation found` / `[violation]` markers, NOT the process exit code
@@ -48,9 +48,9 @@ SHED_DELTA=9999999  # swap-growth trigger DISABLED on purpose (avail is the only
 [[ -f "$CFG" ]] || { echo "FATAL: config not found: $CFG (run from spec/ or pass a valid path)"; exit 1; }
 mkdir -p "$LOGDIR"
 
-# The complete g_* partition of inv ∧ rsInv (33 invPure families incl typeOK + 14 rsInvPure).
+# The complete g_* partition of inv ∧ rsInv (33 invPure families incl typeOK + 15 rsInvPure).
 # SWEEP_FAMILIES (space-separated g_* names) overrides this with a SUBSET for
-# targeted re-verification of specific families; the full-47 completeness assertion
+# targeted re-verification of specific families; the full-48 completeness assertion
 # is skipped for a subset, but the no-duplicates assertion always applies.
 if [[ -n "${SWEEP_FAMILIES:-}" ]]; then FAMILIES=($SWEEP_FAMILIES); else
 FAMILIES=(
@@ -68,10 +68,11 @@ FAMILIES=(
   g_rsCursorCoherence g_rsCompleteness g_rsChildFreeSlot g_rsClaimContinuity
   g_h0LoadedNoTransfer g_rsChildKeyFresh g_hLoopLoadedNoTransfer
   g_shadowGhostForm g_lc10AtDone g_tryingOwnerUnique g_carriedClaimExists
+  g_rsEntryHome
 )
 fi
 TOTAL=${#FAMILIES[@]}
-[[ -n "${SWEEP_FAMILIES:-}" ]] || [[ "$TOTAL" -eq 47 ]] || { echo "FATAL: expected 47 families, got $TOTAL"; exit 1; }
+[[ -n "${SWEEP_FAMILIES:-}" ]] || [[ "$TOTAL" -eq 48 ]] || { echo "FATAL: expected 48 families, got $TOTAL"; exit 1; }
 UNIQ=$(printf '%s\n' "${FAMILIES[@]}" | sort -u | wc -l | tr -d ' '); [[ "$UNIQ" -eq "$TOTAL" ]] || { echo "FATAL: duplicate families ($UNIQ unique of $TOTAL)"; exit 1; }
 
 avail_mb() { vm_stat 2>/dev/null | awk '/page size of/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/){ps=$i;break}} /^Pages free/{gsub(/\./,"",$3);f=$3} /^Pages inactive/{gsub(/\./,"",$3);n=$3} /^Pages speculative/{gsub(/\./,"",$3);s=$3} /^Pages purgeable/{gsub(/\./,"",$3);p=$3} END{if(ps>0) print int((f+n+s+p)*ps/1048576); else print -1}'; }
@@ -103,7 +104,13 @@ base_swap=$(swap_used_mb)
     [[ $any -eq 0 ]] && break
     if [[ $reaped -eq 0 && $t -ge $REAP_AFTER ]]; then reaped=1
       for g in $(seq 0 $((N-1))); do kill -0 "${PID[$g]}" 2>/dev/null || continue
-        [[ "$(server_cpu_on_port ${PORT[$g]})" -lt 15 ]] && { echo "MONITOR: group $g handshake-hung — killing" >>"$LOGDIR/grp${g}.log"; kill_group $g; }
+        # A completed gRPC handshake is signalled by Apalache emitting ANY
+        # `PASS #N` line; its absence after REAP_AFTER is the true hang. The old
+        # CPU-time heuristic parsed `ps -o time=` as macOS `MM:SS.ff` and thus
+        # UNDERCOUNTED on Linux (`HH:MM:SS`), false-killing healthy 2gen solves
+        # (which reach BoundedChecker with <15 parsed "seconds"). Log-progress is
+        # platform-independent and is the signal we actually mean.
+        grep -qE 'PASS #[0-9]' "$LOGDIR/grp${g}.log" 2>/dev/null || { echo "MONITOR: group $g handshake-hung (no Apalache PASS after ${REAP_AFTER}s) — killing" >>"$LOGDIR/grp${g}.log"; kill_group $g; }
       done
     fi
     av=$(avail_mb); sw=$(( $(swap_used_mb) - base_swap ))
