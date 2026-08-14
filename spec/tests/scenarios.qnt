@@ -9,9 +9,11 @@ module scenarios {
     procSet = Set("p1", "p2"),
     keyDomain = Set("k1", "k2"),
     valDomain = Set("v1", "v2"),
-    numBins = 1,
+    maxGen = 0,
     slotsPerBin = 3,
-    hash = Map("k1" -> 1, "k2" -> 1),
+    // Both keys land in gen-0's single bin (x % 1 == 0) — the same collision
+    // the Phase 0 suite exercised at numBins = 1.
+    hashRaw = Map("k1" -> 0, "k2" -> 1),
   ) as protocol from "../checked"
 
   def retIs(p, okExpected, valExpected) = {

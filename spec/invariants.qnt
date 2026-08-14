@@ -22,12 +22,19 @@ module invariants {
       )
     )
 
+  // A real key routes to its bin by the bin's OWN generation; the transfer
+  // sentinel appears only in bins that have begun (or finished) transfer —
+  // sentinels persist in dead-bin slot keys forever (design §4 precision
+  // note), so the sentinel arm is tied to binState, not to InTransfer alone.
   pure def hashConsistencyPure(st: SpecState): bool =
     binDomain.forall(b =>
       slotIdx.forall(s =>
         match st.slotKey.get(b).get(s) {
-          | Some(k) => binOf(k) == b
-          | _ => true
+          | Some(hk) => match hk {
+              | HKey(k) => binFor(k, genOfBin(b)) == b
+              | HSentinel => st.header.get(b).binState != NoTransfer
+            }
+          | None => true
         }
       )
     )
@@ -39,14 +46,18 @@ module invariants {
       (st.op.get(p) == opFromPC(PcI1) and Set(PcI4, PcI5, PcI6).contains(st.pc.get(p))) or
       (st.op.get(p) == opFromPC(PcLC1) and Set(PcLC4, PcLC5, PcLC8, PcLC9).contains(st.pc.get(p)))
     ) and
-      binOf(keyOfProcIn(st, p)) == b and
+      binFor(keyOfProcIn(st, p), st.local.get(p).gen) == b and
       st.local.get(p).targetSlot == s
   }
 
+  // NoTransfer-scoped (design §7): a Trying slot on a non-NoTransfer bin is
+  // ABANDONED (unreserve refusal, I6/LC8/LC9) — its owner redirected and the
+  // stale reservation persists in the transferring/dead bin with no claimant.
   pure def tryingOwnedUniquePure(st: SpecState): bool =
     binDomain.forall(b =>
       slotIdx.forall(s =>
-        (st.header.get(b).slotState.get(s) == Trying).implies(
+        (st.header.get(b).slotState.get(s) == Trying and
+            st.header.get(b).binState == NoTransfer).implies(
           procSet.exists(p =>
             ownsTryingIn(st, p, b, s) and
               procSet.forall(q => ownsTryingIn(st, q, b, s).implies(q == p))
@@ -55,18 +66,83 @@ module invariants {
       )
     )
 
-  // Shadow is held between LC5's CAS and the LC7 commit/abort.
+  // R20 (1b consecution support, 2-proc): AT MOST ONE owner per reserved slot,
+  // on EVERY binState. tryingOwnedUnique asserts existence+uniqueness only on
+  // NoTransfer bins (it must exempt dead/InTransfer bins from EXISTENCE — an
+  // abandoned reservation there is owner-less). But UNIQUENESS holds on all
+  // bins: the reserve CAS (I3/LC3) requires the slot Invalid, so a second
+  // reserver always fails while the first holds it Trying; two distinct procs
+  // never simultaneously own one slot, dead bin or not.
+  //   Why 2-proc consecution needs it: with two keys colliding in a gen-0 bin
+  // that then dies, the anchor fabricates p1 (Insert) and p2 (LoadOrCompute)
+  // both owning the same dead-bin Trying slot; one's fill breaks the other's
+  // freshReservationEmpty. tryingOwnedUnique exempts the dead bin, so only this
+  // standalone uniqueness rejects the (unreachable) double-owner pre-state.
+  // In rsInvPure (vacuous at 1-proc — needs two distinct procs — and at
+  // maxGen=0 tryingOwnedUnique already gives it on the all-NoTransfer surface).
+  pure def tryingOwnerUniquePure(st: SpecState): bool =
+    binDomain.forall(b =>
+      slotIdx.forall(s =>
+        procSet.forall(p =>
+          procSet.forall(q =>
+            (ownsTryingIn(st, p, b, s) and ownsTryingIn(st, q, b, s)).implies(p == q)))))
+
+  // Shadow is held between LC5's CAS and the LC7 commit/abort. GEN-AWARE
+  // (design §7's shadowOwnedUnique row: ownership re-stated via claim
+  // continuity, not naive per-bin owner-existence): from rsShadowCarry until
+  // the holder's LC10 relocation(s) complete, the LIVE claim sits at SOME
+  // generation g2 AHEAD of the holder's — possibly several: a fully laggard
+  // holder (parked at LC6 since its LC5) can have its claim carried gen0 ->
+  // gen1 -> gen2 across two complete resizes before it runs again (2gen
+  // simulator finding). The carried copy is identified by its KEY, not by
+  // targetSlot (each child slot is the daemon's pick, unknown to the holder
+  // until LC10 finds it); the chain conjunct — every generation from the
+  // holder's up to (excluding) the claim's has LEFT NoTransfer — pins the
+  // arm to genuine carry windows: a carry out of g3 only happens while
+  // binFor(k, g3) is InTransfer, and bins never return to NoTransfer.
+  // Dead ancestors' restored Shadow slots stay unowned — exempt via
+  // shadowOwnedUnique's NoTransfer scoping.
   pure def ownsShadowIn(st: SpecState, p: PROC, b: BinIdx, s: SlotIdx): bool = {
+    val k = keyOfProcIn(st, p)
+    val gp = st.local.get(p).gen
     st.op.get(p) == opFromPC(PcLC1) and
-      Set(PcLC6, PcLC7).contains(st.pc.get(p)) and
-      binOf(keyOfProcIn(st, p)) == b and
-      st.local.get(p).targetSlot == s
+      (
+        (Set(PcLC6, PcLC7).contains(st.pc.get(p)) and
+          binFor(k, gp) == b and
+          st.local.get(p).targetSlot == s)
+        or
+        (Set(PcLC6, PcLC7, PcLC10).contains(st.pc.get(p)) and
+          genDomain.exists(g2 =>
+            g2 > gp and
+            binFor(k, g2) == b and
+            st.slotKey.get(b).get(s) == Some(HKey(k)) and
+            genDomain.forall(g3 =>
+              (gp <= g3 and g3 < g2).implies(
+                st.header.get(binFor(k, g3)).binState != NoTransfer))))
+      )
   }
 
+  // Scoped to NON-DEAD bins (binState != DoneTransfer). STRENGTHENED in 1b
+  // from the 1a NoTransfer-only scope: an InTransfer bin's Shadow is also
+  // owned — by the holder spinning at PcLC6 (it published the Shadow at LC5
+  // while the bin was NoTransfer; LC6 spins, gen unchanged, while the bin
+  // transfers — ownsShadowIn's first arm covers it). Leaving InTransfer bins
+  // exempt (the 1a scope) let the system anchor fabricate a PHANTOM Shadow in
+  // an InTransfer bin with no holder; rsShadowCarry then propagated it to a
+  // NoTransfer child where ownership IS required and none existed (1b CEX).
+  // DoneTransfer is the ONLY exemption BY DESIGN (§4.4(ii), §7): a dead bin's
+  // Shadow slots are INTENTIONALLY unowned — rsDone's snapshot-overwrite
+  // leaves them behind and the holder has already relocated past via LC10, so
+  // there is no live owner to require (and none is owed). The carried child
+  // Shadow is owned by the same holder via ownsShadowIn's gen-aware carried
+  // arm. Reachable-true (every non-dead Shadow has a live holder) and inert at
+  // maxGen=0 (genTopology forbids non-NoTransfer bins there, so != DoneTransfer
+  // == NoTransfer).
   pure def shadowOwnedUniquePure(st: SpecState): bool =
     binDomain.forall(b =>
       slotIdx.forall(s =>
-        (st.header.get(b).slotState.get(s) == Shadow).implies(
+        (st.header.get(b).slotState.get(s) == Shadow and
+            st.header.get(b).binState != DoneTransfer).implies(
           procSet.exists(p =>
             ownsShadowIn(st, p, b, s) and
               procSet.forall(q => ownsShadowIn(st, q, b, s).implies(q == p))
@@ -74,6 +150,65 @@ module invariants {
         )
       )
     )
+
+  // R23 (1b 2-proc consecution support — the claim-EXISTENCE family the §1c
+  // note at the contract-corollaries flagged as missing: "nothing in inv yet
+  // forces a PcLC10 proc to POSSESS a carried claim"). A LoadOrCompute holder
+  // past LC5 (PcLC6/PcLC7/PcLC10) whose OWN-generation bin has gone DEAD
+  // (DoneTransfer) POSSESSES its carried Shadow one generation ahead: there is a
+  // Shadow slot in binFor(k, gen+1) keyed HKey(k).
+  //   WHY 2-proc consecution needs it (replaces the over-broad R21
+  // claimOwnerUnique, which was reachable-true but NOT inductive). ownsShadowIn
+  // arm 2 identifies a holder's carried claim by KEY + gen-chain ALONE, NOT by
+  // the matched slot actually being the holder's live Shadow. So without R23 the
+  // system anchor fabricates a holder parked on a dead bin whose carried Shadow
+  // is ABSENT, and arm 2 latches onto whatever same-key slot sits at the child
+  // bin — a SECOND proc's Trying reservation (CEX1: its LC5 publish then makes
+  // both arm-1 publisher and arm-2 ghost own the Shadow) or an Invalid stale-key
+  // slot (CEX2: I3 reserve makes the Trying owner collide with the arm-2 ghost;
+  // unreserve leaves slotKey, invalidSlotClean cleans only val+tag). R23 forces
+  // the carried Shadow to EXIST, so arm 2 names the holder's REAL Shadow, which
+  // rsClaimContinuity (R12, <=1 k-Shadow among NoTransfer bins) makes unique =>
+  // exactly one owner.
+  //   REACHABLE-TRUE / inductive: rsDone flips a bin DoneTransfer only at
+  // nextSlot(snap,cursor)==0, i.e. AFTER rsShadowCarry copied every snapshot
+  // Shadow to the child (rsCompleteness R11's Shadow arm) — so a dead-bin
+  // holder's child Shadow always exists. The dangerous step rsDone establishes
+  // the consequent via R11; LC5 publish leaves the own-gen bin NoTransfer
+  // (antecedent false); LC10 relocation advances gen so the antecedent re-checks
+  // against the new own-gen bin. In rsInvPure: inert at maxGen=0 (genTopology
+  // R1 forbids DoneTransfer bins there => antecedent vacuous); the g < maxGen
+  // guard keeps binFor(k, gen+1) in-domain (a Done bin has gen < maxGen, via
+  // genTopology — see lc10AtDone/R19). NOT 1-proc-vacuous (one proc can be a
+  // dead-bin holder), which is fine for the rsInv tier.
+  // 2GEN GENERALIZATION (2026-07-06, rs_2gen_2p_grp1 CEX): the original form
+  // checked ONLY the holder's own gen (g == gp), asserting the carried Shadow at
+  // gp+1. Not inductive at maxGen>=2: LC10 relocates a holder INTO a gen-1 bin that
+  // is ITSELF DoneTransfer, and the re-checked antecedent then demands the Shadow at
+  // gp+2 — which R11 (rsCompleteness, InTransfer-scoped) never forces for an
+  // already-Done bin (its snapshot arm releases at Done). Fix: quantify g over EVERY
+  // gen >= gp along the key's chain whose bin is DoneTransfer, requiring the carried
+  // Shadow one gen ahead of EACH. Reachable-true: while a holder climbs
+  // (pc in {LC6,LC7,LC10}) it is the unique k-claimant (rsClaimContinuity R12) and
+  // has NOT committed (LC7 commit / LC9 abort fire only on a NoTransfer top), so
+  // every Done bin on its chain still has its carried Shadow. INERT at maxGen<=1 BY
+  // CONSTRUCTION: genDomain = 0.to(maxGen), so [gp, maxGen) admits only g == gp there
+  // — bit-identical to the pre-fix form, leaving the green 1gen / maxGen0 gates
+  // untouched; the g > gp arms activate only at maxGen>=2.
+  pure def carriedClaimExistsPure(st: SpecState): bool =
+    procSet.forall(p => {
+      val k = keyOfProcIn(st, p)
+      val gp = st.local.get(p).gen
+      val isClimber = st.op.get(p) == opFromPC(PcLC1) and
+        Set(PcLC6, PcLC7, PcLC10).contains(st.pc.get(p))
+      isClimber.implies(
+        genDomain.forall(g =>
+          (gp <= g and g < maxGen and
+            st.header.get(binFor(k, g)).binState == DoneTransfer).implies(
+              slotIdx.exists(t =>
+                st.header.get(binFor(k, g + 1)).slotState.get(t) == Shadow and
+                st.slotKey.get(binFor(k, g + 1)).get(t) == Some(HKey(k))))))
+    })
 
   // LC4 writes slotKey before LC5 publishes Shadow, so this is always satisfied
   // for a properly published Shadow slot.
@@ -113,9 +248,13 @@ module invariants {
           Set(PcP6, PcP7, PcD6, PcD7).contains(st.pc.get(p)) and
           st.local.get(p).targetSlot != 0 and
           st.local.get(p).expectedTag != None and
-          st.local.get(p).expectedTag == st.slotTag.get(binOf(keyOfProcIn(st, p))).get(st.local.get(p).targetSlot)
+          st.local.get(p).expectedTag == st.slotTag.get(binFor(keyOfProcIn(st, p), st.local.get(p).gen)).get(st.local.get(p).targetSlot)
       ).implies(
-        st.local.get(p).expectedVal == st.slotVal.get(binOf(keyOfProcIn(st, p))).get(st.local.get(p).targetSlot)
+        // expectedVal is Option[VAL] (it feeds ret); compare the projection.
+        match st.slotVal.get(binFor(keyOfProcIn(st, p), st.local.get(p).gen)).get(st.local.get(p).targetSlot) {
+          | Some(e) => st.local.get(p).expectedVal == Some(e.v)
+          | None => st.local.get(p).expectedVal == None
+        }
       )
     )
 
@@ -128,8 +267,26 @@ module invariants {
       )
     )
 
-  // Generalizes visibleKeyUniquePerBin to also forbid two Shadow slots, or a
-  // Shadow + Valid pair, sharing a key in the same bin.
+  // At most one live (Valid or Shadow) val-bearing slot per ENTRY-key in a bin.
+  //
+  // ENTRY-KEY form (1b — keys off slotVal.k, the entry's own key, NOT the
+  // hash word slotKey). Two reasons this is the right witness:
+  //   (1) Robust to sentineling: rsSentinel overwrites a snapshot-Valid slot's
+  //       slotKey with HSentinel while rsMove leaves its ENTRY intact, so a
+  //       slot's true key survives in slotVal even when slotKey == HSentinel.
+  //       The earlier HKey-witnessed form missed a duplicate where one slot
+  //       was sentineled (1b CEX: a Shadow-k claim coexisting with a
+  //       sentineled committed Valid-k — unreachable, LC2 never claims a
+  //       visible key — slipped past HKey matching).
+  //   (2) It SUBSUMES candidate-scan uniqueness: by entryKeyAgreement / F2 a
+  //       live slot's slotKey is HKey(entry.k) unless sentineled, so two
+  //       candidates (slotKey HKey(k)) are two entries with key k -> the same
+  //       slot here. So minOr0 over candidates AND over the visible set both
+  //       stay <=1-element.
+  // A DEAD bin's surviving entries are the distinct pre-transfer keys
+  // (pre-OR uniqueness preserved), so this passes dead bins (no false dup).
+  // At maxGen=0 (no sentinels) slotKey == HKey(entry.k) for every live slot,
+  // so this is logically identical to the Phase-0 / HKey-witnessed form.
   pure def liveKeyUniquePerBinPure(st: SpecState): bool =
     binDomain.forall(b =>
       slotIdx.forall(s1 =>
@@ -137,27 +294,35 @@ module invariants {
           (
             (st.header.get(b).slotState.get(s1) == Valid or st.header.get(b).slotState.get(s1) == Shadow) and
               (st.header.get(b).slotState.get(s2) == Valid or st.header.get(b).slotState.get(s2) == Shadow) and
-              st.slotVal.get(b).get(s1) != None and
-              st.slotVal.get(b).get(s2) != None and
-              st.slotKey.get(b).get(s1) == st.slotKey.get(b).get(s2) and
-              st.slotKey.get(b).get(s1) != None
+              match st.slotVal.get(b).get(s1) {
+                | Some(e1) => match st.slotVal.get(b).get(s2) {
+                    | Some(e2) => e1.k == e2.k
+                    | None => false
+                  }
+                | None => false
+              }
           ).implies(s1 == s2)
         )
       )
     )
 
+  // NoTransfer-scoped (design §7): rsDone's snapshot restore can resurrect
+  // D8-cleared Valid bits, creating dead-bin Valid+val-None shapes with no
+  // owner; abandoned windows in transferring bins likewise have no live
+  // claimant. Ownership is only claimed where the bin is still NoTransfer.
   pure def deleteWindowOwnedPure(st: SpecState): bool =
     binDomain.forall(b =>
       slotIdx.forall(s =>
         (
-          st.header.get(b).slotState.get(s) == Valid and
+          st.header.get(b).binState == NoTransfer and
+            st.header.get(b).slotState.get(s) == Valid and
             st.slotVal.get(b).get(s) == None and
             st.slotTag.get(b).get(s) == None
         ).implies(
           procSet.exists(p =>
             st.pc.get(p) == PcD8 and
               st.op.get(p) == opFromPC(PcD1) and
-              binOf(keyOfProcIn(st, p)) == b and
+              binFor(keyOfProcIn(st, p), st.local.get(p).gen) == b and
               st.local.get(p).targetSlot == s
           )
         )
@@ -184,7 +349,7 @@ module invariants {
   // and a freshly reserved slot's tag was never visible to any other proc.
   pure def ownerSlotStateConsistentPure(st: SpecState): bool =
     procSet.forall(p => {
-      val b = binOf(keyOfProcIn(st, p))
+      val b = binFor(keyOfProcIn(st, p), st.local.get(p).gen)
       val s = st.local.get(p).targetSlot
       and {
         (st.op.get(p) == Some(Insert) and Set(PcI4, PcI5, PcI6).contains(st.pc.get(p)))
@@ -204,20 +369,20 @@ module invariants {
   pure def ownerSlotFilledPure(st: SpecState): bool =
     procSet.forall(p => {
       val k = keyOfProcIn(st, p)
-      val b = binOf(k)
+      val b = binFor(k, st.local.get(p).gen)
       val s = st.local.get(p).targetSlot
       and {
         (st.op.get(p) == Some(Insert) and Set(PcI5, PcI6).contains(st.pc.get(p)))
           .implies(
-            st.slotKey.get(b).get(s) == Some(k) and
-            st.slotVal.get(b).get(s) == Some(valOfProcIn(st, p)) and
+            st.slotKey.get(b).get(s) == Some(HKey(k)) and
+            st.slotVal.get(b).get(s) == Some({ k: k, v: valOfProcIn(st, p) }) and
             st.slotTag.get(b).get(s) != None
           ),
         (st.op.get(p) == Some(LoadOrCompute) and
             Set(PcLC5, PcLC6, PcLC7, PcLC8, PcLC9).contains(st.pc.get(p)))
           .implies(
-            st.slotKey.get(b).get(s) == Some(k) and
-            st.slotVal.get(b).get(s) == Some(anyVal) and
+            st.slotKey.get(b).get(s) == Some(HKey(k)) and
+            st.slotVal.get(b).get(s) == Some({ k: k, v: anyVal }) and
             st.slotTag.get(b).get(s) != None
           ),
       }
@@ -233,7 +398,7 @@ module invariants {
     procSet.forall(p =>
       (st.pc.get(p) == PcD8).implies({
         val k = keyOfProcIn(st, p)
-        val b = binOf(k)
+        val b = binFor(k, st.local.get(p).gen)
         val s = st.local.get(p).targetSlot
         st.ret.get(p) == mkResult(true, st.local.get(p).expectedVal) and
         st.local.get(p).expectedVal != None and
@@ -241,7 +406,12 @@ module invariants {
         st.header.get(b).slotState.get(s) == Valid and
         st.slotVal.get(b).get(s) == None and
         st.slotTag.get(b).get(s) == None and
-        st.slotKey.get(b).get(s) == Some(k)
+        // The parked deleter's slot is snapshot-Valid, so rsSentinel may
+        // overwrite its key mid-transfer (design §7): the sentinel arm is
+        // tied to the bin having left NoTransfer.
+        (st.slotKey.get(b).get(s) == Some(HKey(k)) or
+          (st.slotKey.get(b).get(s) == Some(HSentinel) and
+            st.header.get(b).binState != NoTransfer))
       })
     )
 
@@ -285,7 +455,7 @@ module invariants {
         st.local.get(p).expectedTag != None and
         procSet.forall(q =>
           (st.pc.get(q) == PcD8 and
-            binOf(keyOfProcIn(st, q)) == binOf(keyOfProcIn(st, p)) and
+            binFor(keyOfProcIn(st, q), st.local.get(q).gen) == binFor(keyOfProcIn(st, p), st.local.get(p).gen) and
             st.local.get(q).targetSlot == st.local.get(p).targetSlot
           ).implies(q == p)
         )
@@ -304,7 +474,7 @@ module invariants {
   pure def reservedKeyFreshPure(st: SpecState): bool =
     procSet.forall(p => {
       val k = keyOfProcIn(st, p)
-      val b = binOf(k)
+      val b = binFor(k, st.local.get(p).gen)
       val s = st.local.get(p).targetSlot
       val holdsSlot =
         (st.op.get(p) == Some(Insert) and Set(PcI4, PcI5).contains(st.pc.get(p))) or
@@ -312,10 +482,14 @@ module invariants {
       (holdsSlot and slotIdx.contains(s)).implies({
         val expectedH = {
           version: st.local.get(p).h0.version + 1,
+          binState: st.local.get(p).h0.binState,
           slotState: st.local.get(p).h0.slotState.set(s, Trying),
         }
+        // CANDIDATE form (design §6): this family certifies the OP's scan
+        // (I2/LC2 routed here through the hash-word match), not the
+        // abstraction — the shadow check stays alongside it.
         (st.header.get(b) == expectedH).implies(
-          visibleSlotsByHeaderFrom(st.header.get(b), st.slotKey, st.slotVal, st.slotTag, b, k).size() == 0 and
+          candidateSlotsByHeaderFrom(st.header.get(b), st.slotKey, st.slotVal, st.slotTag, b, k).size() == 0 and
           shadowSlotsByHeaderFrom(st.header.get(b), st.slotKey, b, k).size() == 0
         )
       })
@@ -338,14 +512,14 @@ module invariants {
   pure def reservedKeyFreshAtReservePure(st: SpecState): bool =
     procSet.forall(p => {
       val k = keyOfProcIn(st, p)
-      val b = binOf(k)
+      val b = binFor(k, st.local.get(p).gen)
       val s = st.local.get(p).targetSlot
       val atReserve =
         (st.op.get(p) == Some(Insert) and st.pc.get(p) == PcI3) or
         (st.op.get(p) == Some(LoadOrCompute) and st.pc.get(p) == PcLC3)
       atReserve.implies(
         (st.header.get(b) == st.local.get(p).h0).implies(
-          visibleSlotsByHeaderFrom(st.header.get(b), st.slotKey, st.slotVal, st.slotTag, b, k).size() == 0 and
+          candidateSlotsByHeaderFrom(st.header.get(b), st.slotKey, st.slotVal, st.slotTag, b, k).size() == 0 and
           shadowSlotsByHeaderFrom(st.header.get(b), st.slotKey, b, k).size() == 0
         )
       )
@@ -369,11 +543,15 @@ module invariants {
   // bump" configuration. (Strictness — +1 not +0 — is the whole point;
   // versionMonotonic only gives h0.version <= header.version.)
   pure val postReserveInsertPCs: Set[PC] = Set(PcI4, PcI5, PcI6)
-  pure val postReserveLCPCs: Set[PC] = Set(PcLC4, PcLC5, PcLC6, PcLC7, PcLC8, PcLC9)
+  // LC arm shrunk to the reserve window {PcLC4, PcLC5} (design §7): after the
+  // holder relocation lands (Part II, PcLC10), h0 is refreshed to the CHILD's
+  // header at LC6+ — the parent-relative version bound is meaningless there.
+  // The mechanism only ever covered the reserve window.
+  pure val postReserveLCPCs: Set[PC] = Set(PcLC4, PcLC5)
 
   pure def reserveBumpedVersionPure(st: SpecState): bool =
     procSet.forall(p => {
-      val b = binOf(keyOfProcIn(st, p))
+      val b = binFor(keyOfProcIn(st, p), st.local.get(p).gen)
       and {
         (st.op.get(p) == Some(Insert) and postReserveInsertPCs.contains(st.pc.get(p)))
           .implies(st.header.get(b).version >= st.local.get(p).h0.version + 1),
@@ -406,7 +584,7 @@ module invariants {
   // antecedent only becomes true on genuinely-current snapshots.
   pure def reserveHeaderAgreesPure(st: SpecState): bool =
     procSet.forall(p => {
-      val b = binOf(keyOfProcIn(st, p))
+      val b = binFor(keyOfProcIn(st, p), st.local.get(p).gen)
       val s = st.local.get(p).targetSlot
       val holdsSlot =
         (st.op.get(p) == Some(Insert) and Set(PcI4, PcI5).contains(st.pc.get(p))) or
@@ -414,9 +592,25 @@ module invariants {
       (holdsSlot and slotIdx.contains(s)).implies({
         val expectedH = {
           version: st.local.get(p).h0.version + 1,
+          binState: st.local.get(p).h0.binState,
           slotState: st.local.get(p).h0.slotState.set(s, Trying),
         }
-        (st.header.get(b).version == expectedH.version).implies(
+        // NoTransfer-scoped (1b): the version-frozen agreement holds only
+        // while the bin is NoTransfer. This scoping excludes a DESIGN-ALLOWED
+        // window, not a bug: rsDone (§4.4) restores a bin's header from its
+        // snapshot WITHOUT a version bump, which LEGITIMATELY RESURRECTS a slot
+        // Invalid -> Valid at a frozen version on the now-dead bin — the
+        // opposite of the Valid -> Invalid D8 clears this family permits. A
+        // reserver whose bin gets transferred-and-Done under it (PcLC4/I4 with
+        // expectedH version still matching the frozen live version) would then
+        // see that legitimate resurrection as a forbidden disagreement. But
+        // reserveHeaderAgrees
+        // exists ONLY to support reservedKeyFresh, which is vacuous on a
+        // non-NoTransfer bin (its header == expectedH cannot hold once
+        // binState differs); such a reserver abandons at LC5/LC8 anyway. So
+        // the agreement is needed, and true, only on NoTransfer bins.
+        (st.header.get(b).version == expectedH.version and
+            st.header.get(b).binState == NoTransfer).implies(
           slotIdx.forall(t =>
             st.header.get(b).slotState.get(t) == expectedH.slotState.get(t) or
             (expectedH.slotState.get(t) == Valid and st.header.get(b).slotState.get(t) == Invalid)
@@ -477,7 +671,7 @@ module invariants {
   // the only bridge from 'tag matched' to 'slot Valid'.
   pure def commitTagImpliesValidPure(st: SpecState): bool =
     procSet.forall(p => {
-      val b = binOf(keyOfProcIn(st, p))
+      val b = binFor(keyOfProcIn(st, p), st.local.get(p).gen)
       val s = st.local.get(p).targetSlot
       val atCommit =
         (st.op.get(p) == Some(Put) and st.pc.get(p) == PcP7) or
@@ -503,7 +697,7 @@ module invariants {
 
   pure def versionMonotonicPure(st: SpecState): bool =
     procSet.forall(p => {
-      val b = binOf(keyOfProcIn(st, p))
+      val b = binFor(keyOfProcIn(st, p), st.local.get(p).gen)
       and {
         h0LivePCs.contains(st.pc.get(p))
           .implies(st.local.get(p).h0.version <= st.header.get(b).version),
@@ -531,7 +725,7 @@ module invariants {
   // run. Pinning val/tag == None at PcI4/PcLC4 removes that forged occupant.
   pure def freshReservationEmptyPure(st: SpecState): bool =
     procSet.forall(p => {
-      val b = binOf(keyOfProcIn(st, p))
+      val b = binFor(keyOfProcIn(st, p), st.local.get(p).gen)
       val s = st.local.get(p).targetSlot
       val atFill =
         (st.op.get(p) == Some(Insert) and st.pc.get(p) == PcI4) or
@@ -567,14 +761,35 @@ module invariants {
       (snap.slotState.get(s) == Valid and live.slotState.get(s) == Invalid)
     )
 
+  // BOTH antecedents are NoTransfer-scoped on the SNAPSHOT and the LIVE header
+  // (design §7, with a concrete counterexample): the OR (rsBegin) and Done
+  // (rsDone) stores change binState WITHOUT a version bump, so equal-version
+  // snapshots can straddle transfer transitions. Two failure modes, both
+  // gated out here:
+  //   (a) a P4 hLoop captured during InTransfer (P4 has no binState check) vs
+  //       a later header — gated by the LOCAL snapshot's binState == NoTransfer;
+  //   (b) rsDone (§4.4) LEGITIMATELY RESURRECTS a slot Invalid -> Valid
+  //       (snapshot-overwrite, no version bump) on the now-DEAD bin — a
+  //       design-allowed window, not a bug — so a NoTransfer snapshot at the
+  //       still-frozen version disagrees in the forbidden Invalid -> Valid
+  //       direction — gated by the LIVE header's binState == NoTransfer (1b
+  //       CEX). Sound because every consumer re-checks header == h0/hLoop (the
+  //       FULL record, incl. binState) before acting: once the live bin leaves
+  //       NoTransfer the op reclassifies/retries (P6/D6 fail; the h0 guards
+  //       mismatch), so the snapshot agreement is never relied upon on a
+  //       non-NoTransfer live bin. Inert at maxGen=0 (every bin is NoTransfer).
   pure def snapStateAgreesPure(st: SpecState): bool =
     procSet.forall(p => {
-      val b = binOf(keyOfProcIn(st, p))
+      val b = binFor(keyOfProcIn(st, p), st.local.get(p).gen)
       and {
         (h0LivePCs.contains(st.pc.get(p)) and
+          st.local.get(p).h0.binState == NoTransfer and
+          st.header.get(b).binState == NoTransfer and
           st.local.get(p).h0.version == st.header.get(b).version)
           .implies(snapAgreesUpToClear(st.local.get(p).h0, st.header.get(b))),
         (hLoopLivePCs.contains(st.pc.get(p)) and
+          st.local.get(p).hLoop.binState == NoTransfer and
+          st.header.get(b).binState == NoTransfer and
           st.local.get(p).hLoop.version == st.header.get(b).version)
           .implies(snapAgreesUpToClear(st.local.get(p).hLoop, st.header.get(b))),
       }
@@ -585,8 +800,10 @@ module invariants {
   // (false, None) "key absent". For that to refine the abstract op, k must be
   // genuinely absent from the bin's VISIBLE set in this anchored state. The
   // protocol guarantees it: targetSlot was computed at P2/D2 as
-  //   slotForKeyByHeader(h0, b, k) = minOr0(visibleSlotsByHeader(h0, b, k)),
-  // so targetSlot == 0 means NO slot was visible for k under the snapshot h0.
+  //   slotForKeyByHeader(h0, b, k) = minOr0(candidateSlotsByHeader(h0, b, k))
+  // (the CANDIDATE form — hash-word match, design §6; sentineled slots excluded).
+  // Every visible-for-k slot (Valid with key k) is a candidate, so targetSlot == 0
+  // (no candidate) means NO slot was visible for k under the snapshot h0.
   // While header == h0 still holds (the seqlock has not moved since the
   // snapshot), no slot can BECOME visible-for-k: a slot becomes Valid-visible
   // only via finalize (Invalid/Trying -> Valid, I5/LC7-commit) or a P7 value
@@ -601,16 +818,505 @@ module invariants {
   pure def absentReturnConsistentPure(st: SpecState): bool =
     procSet.forall(p => {
       val k = keyOfProcIn(st, p)
-      val b = binOf(k)
+      val b = binFor(k, st.local.get(p).gen)
       (Set(PcP3, PcD3).contains(st.pc.get(p)) and
         st.header.get(b) == st.local.get(p).h0 and
         st.local.get(p).targetSlot == 0
       ).implies(
-        visibleSlotsByHeaderFrom(st.header.get(b), st.slotKey, st.slotVal, st.slotTag, b, k).size() == 0
+        // ENTRY-key visibility (design §6): the absent-return must mean
+        // ABSTRACT absence; on NoTransfer bins (h0 == header forces one)
+        // it coincides with the candidate scan via entryKeyAgreement.
+        visibleSlotsByHeaderFrom(st.header.get(b), st.slotVal, st.slotTag, b, k).size() == 0
       )
     })
 
+  // ================= RESIZE TOPOLOGY FAMILIES (R1-R5) =====================
+  // Degenerate-true at maxGen=0 (all bins NoTransfer, activeGen ==
+  // maxAllocatedGen == 0, every local gen 0); load-bearing once the daemon
+  // exists (Part II). Reachable-true claims in 1a; inductiveness is stage
+  // 1b's gate.
+
+  // R1: generation topology (design §7.1 + erratum). Bins of finished gens
+  // are all Done; future gens untouched; InTransfer only in the resizing
+  // gen; and — the clause the design's first draft MISSED (review finding) —
+  // the ACTIVE generation's bins are all NoTransfer while no resize is
+  // running. Without that fourth clause the anchor can fabricate Done bins
+  // in the active gen (at maxGen=0 a classified op would then walk to a
+  // nonexistent gen 1 -> out-of-domain map access). Mid-resize
+  // (maxAllocatedGen == activeGen + 1) the clause is vacuous, so the
+  // bins of the resizing gen may legitimately go Done one-by-one before
+  // rsFinalize.
+  pure def genTopologyPure(st: SpecState): bool =
+    binDomain.forall(b => {
+      val g = genOfBin(b)
+      and {
+        (g < st.activeGen).implies(st.header.get(b).binState == DoneTransfer),
+        (g > st.activeGen).implies(st.header.get(b).binState == NoTransfer),
+        (st.header.get(b).binState == InTransfer).implies(
+          g == st.activeGen and st.maxAllocatedGen == st.activeGen + 1),
+        (g == st.activeGen and st.maxAllocatedGen == st.activeGen).implies(
+          st.header.get(b).binState == NoTransfer),
+      }
+    })
+
+  // R2: pristine future generations (design §7.2) — also an anchor cut.
+  pure def pristineFutureGensPure(st: SpecState): bool =
+    binDomain.forall(b =>
+      (genOfBin(b) > st.maxAllocatedGen).implies(
+        st.header.get(b) == emptyHeader and
+        slotIdx.forall(s =>
+          st.slotKey.get(b).get(s) == None and
+          st.slotVal.get(b).get(s) == None and
+          st.slotTag.get(b).get(s) == None)
+      )
+    )
+
+  // R3: per-proc predecessors-Done (design §7.8): every generation the op
+  // has walked past is Done for ITS key — what makes absent-returns refine.
+  pure def predecessorsDonePure(st: SpecState): bool =
+    procSet.forall(p =>
+      (st.op.get(p) != None).implies(
+        genDomain.forall(g =>
+          (g < st.local.get(p).gen).implies(
+            st.header.get(binFor(keyOfProcIn(st, p), g)).binState == DoneTransfer))
+      )
+    )
+
+  // R4: op-gen sanity (design §7.13).
+  pure def opGenSanityPure(st: SpecState): bool =
+    procSet.forall(p =>
+      st.local.get(p).gen <= st.maxAllocatedGen and st.local.get(p).gen <= maxGen
+    )
+
+  // R5: entryKeyAgreement (design §7.10): a Valid slot's hash word agrees
+  // with its entry's key, or is the sentinel (non-NoTransfer bins only —
+  // covered by hashConsistency's sentinel arm). Proves the NoTransfer
+  // candidate≡entry-key scan equivalence.
+  pure def entryKeyAgreementPure(st: SpecState): bool =
+    binDomain.forall(b =>
+      slotIdx.forall(s =>
+        (st.header.get(b).slotState.get(s) == Valid).implies(
+          match st.slotVal.get(b).get(s) {
+            | Some(e) =>
+                st.slotKey.get(b).get(s) == Some(HKey(e.k)) or
+                st.slotKey.get(b).get(s) == Some(HSentinel)
+            | None => true
+          })
+      )
+    )
+
+  // ===== Resize-state families (R6-R12; design §7.3-7, 11, 12) =====
+  // Reachable-true tier for 1a: checked by the simulator on system configs.
+  // Stage 1b decides their inductive wiring (anchor extension).
+  //
+  // WIRING RULE (load-bearing): these take the daemon state (snapshot,
+  // cursor) as PARAMETERS — their types are pure protocol types, so this
+  // module needs NO import of resize.qnt. Importing resize here would
+  // transitively pull the daemon's VARS into induction.qnt's instance,
+  // where indInit does not assign them -> Apalache "used before assigned"
+  // on every induction config. The LIVE wrapper (rsInv) lives in system.qnt.
+
+  // R6: snapshot relation (§7.3): snapshot present IFF bin not NoTransfer.
+  // A snapshot is set ONLY by rsBegin (together with the InTransfer flip) and
+  // is never cleared; the bin only advances InTransfer -> Done — so a bin with
+  // a snapshot is InTransfer or Done, NEVER NoTransfer.
+  //   STRENGTHENED in 1b (was a too-weak disjunction `live != NoTransfer OR
+  // sn.binState == NoTransfer`): that form permitted a fabricated NoTransfer
+  // bin carrying a stale snapshot+cursor, on which rsBegin then fired and
+  // sprang rsCompleteness (the stale cursor claimed slots processed that were
+  // never sentineled). It is also the over-permissiveness the Opus review (I1)
+  // flagged for the maxGen out-of-domain child read — with the strict form a
+  // maxGen bin (always NoTransfer by genTopology) provably carries no
+  // snapshot. The strict form is reachable-true (snapshot present <=>
+  // InTransfer or Done) and inductive (no step gives a NoTransfer bin a
+  // snapshot, and none reverts binState to NoTransfer).
+  //   An InTransfer bin's live header differs from its snapshot only by the
+  // binState bits and D8 Valid->Invalid clears; versions frozen.
+  //   The snapshot itself is the FROZEN pre-OR header, so sn.binState ==
+  // NoTransfer always (rsBegin captures it from a NoTransfer bin; no step
+  // mutates a snapshot afterwards). Enforcing this (Codex review) rejects
+  // anchor-fabricated DoneTransfer/InTransfer snapshots — harmless today (no
+  // family reads sn.binState) but an unreachable shape the hypothesis should
+  // not admit.
+  pure def rsSnapshotRelationPure(st: SpecState, snap: BinIdx -> Option[Header]): bool =
+    binDomain.forall(b => {
+      val live = st.header.get(b)
+      match snap.get(b) {
+        | None => live.binState == NoTransfer
+        | Some(sn) => and {
+            live.binState != NoTransfer,   // snapshot present => InTransfer or Done (strict; see note)
+            sn.binState == NoTransfer,     // snapshot is the frozen pre-OR header
+            (live.binState == InTransfer).implies(and {
+              live.version == sn.version,
+              slotIdx.forall(s =>
+                live.slotState.get(s) == sn.slotState.get(s) or
+                (sn.slotState.get(s) == Valid and live.slotState.get(s) == Invalid)),
+            }),
+          }
+      }
+    })
+
+  // R7: sentinel discipline (§7.4): sentinel => bin not NoTransfer and the
+  // slot was snapshot-Valid.
+  // (The cursor-position half — sentineled s is <= cursor or == nextSlot —
+  // is added in 1b if consecution needs it; it requires the cursor parameter
+  // and is omitted from the 1a reachable-true tier for simplicity.)
+  pure def rsSentinelDisciplinePure(st: SpecState, snap: BinIdx -> Option[Header]): bool =
+    binDomain.forall(b =>
+      slotIdx.forall(s =>
+        (st.slotKey.get(b).get(s) == Some(HSentinel)).implies(and {
+          st.header.get(b).binState != NoTransfer,
+          match snap.get(b) {
+            | Some(sn) => sn.slotState.get(s) == Valid
+            | None => false
+          },
+        })
+      )
+    )
+
+  // R8 (design §7.5, ADJUDICATED): "sentineled-val-frozen" is a
+  // TRANSITION-shaped fact ("no action but rsMove changes a sentineled
+  // slot's val") — it has no instant-state encoding, so it cannot be a 1a
+  // state family. Its inductive role (converting R11's at-sentinel-time
+  // reading into a now-form) lands in 1b as antecedent strengthening.
+
+  // R9: child-bin unobservability (§7.9), BOTH halves: no proc targets a
+  // not-yet-Done parent's children, AND the children hold only
+  // transfer-placed content (an occupied child slot implies its parent is
+  // mid-transfer or done — a child of a NoTransfer parent is empty).
+  // (Quantified parent-side via childrenOf; a parentOf helper is
+  // deliberately NOT defined — it would be partial at gen 0 and currently
+  // has no consumer. Re-add WITH a domain guard if 1b needs it.)
+  pure def rsChildUnobservablePure(st: SpecState): bool =
+    binDomain.forall(b =>
+      (genOfBin(b) < maxGen and st.header.get(b).binState != DoneTransfer).implies(
+        childrenOf(b).forall(cb => and {
+          procSet.forall(p =>
+            (st.op.get(p) != None).implies(
+              binFor(keyOfProcIn(st, p), st.local.get(p).gen) != cb)),
+          // content half: parent not even InTransfer => children pristine
+          (st.header.get(b).binState == NoTransfer).implies(
+            slotIdx.forall(s =>
+              st.header.get(cb).slotState.get(s) == Invalid and
+              st.slotVal.get(cb).get(s) == None)),
+        })
+      )
+    )
+
+  // R10 (design §7.11, ADJUDICATED): the design's `cursor == 0 <=> snapshot
+  // absent` iff is FALSE as an instant invariant (rsBegin sets the snapshot
+  // while the cursor is still 0), and monotonicity is transition-shaped.
+  // The correct stateful reduction:
+  pure def rsCursorCoherencePure(st: SpecState, snap: BinIdx -> Option[Header],
+      cur: BinIdx -> SlotIdx): bool =
+    binDomain.forall(b => and {
+      (cur.get(b) != 0).implies(snap.get(b) != None),
+      (snap.get(b) == None).implies(cur.get(b) == 0),
+      cur.get(b) >= 0 and cur.get(b) <= slotsPerBin,
+    })
+
+  // R11: transfer completeness, cursor-prefix form (§7.6), incl. Shadow
+  // carry. The Valid arm uses the PLACED-IN-CHILD form: rsMove does NOT
+  // clear the parent's slotVal (Go doesn't either), so the moved entry is
+  // still readable in the parent and its child image is directly checkable —
+  // every processed Valid slot is sentineled AND, if its entry survives
+  // (was not deleted pre-sentinel), the same entry sits Valid in the
+  // correct child.
+  //
+  // SCOPED TO InTransfer (simulator-driven adjudication, same shape as
+  // R12b): snapshots are never cleared in 1a, but after rsDone the child is
+  // the AUTHORITATIVE bin — ops legitimately rewrite/delete the child's copy
+  // (post-Done Put, LC7 commit of a carried Shadow) while the dead parent's
+  // snapshot still names the original entry. The design's §7.6 fact is the
+  // no-lost/duplicated-entries claim DURING the transfer, culminating at the
+  // Done flip: the InTransfer scope preserves exactly the state just before
+  // rsDone fires (all transferable slots processed + children untouched by
+  // ops, per R9 unobservability), which is the theorem's instant. Post-Done
+  // child content is governed by the ordinary op families.
+  pure def rsCompletenessPure(st: SpecState, snap: BinIdx -> Option[Header],
+      cur: BinIdx -> SlotIdx): bool =
+    binDomain.forall(b =>
+      match (if (st.header.get(b).binState == InTransfer) snap.get(b) else None) {
+        | Some(sn) =>
+            slotIdx.forall(s => and {
+              (s <= cur.get(b) and sn.slotState.get(s) == Shadow).implies(
+                match st.slotKey.get(b).get(s) {
+                  | Some(hk) => match hk {
+                      | HKey(k) => {
+                          val cb = binFor(k, genOfBin(b) + 1)
+                          slotIdx.exists(t =>
+                            st.header.get(cb).slotState.get(t) == Shadow and
+                            st.slotKey.get(cb).get(t) == Some(HKey(k)))
+                        }
+                      | HSentinel => false
+                    }
+                  | None => false
+                }),
+              (s <= cur.get(b) and sn.slotState.get(s) == Valid).implies(and {
+                st.slotKey.get(b).get(s) == Some(HSentinel),
+                match st.slotVal.get(b).get(s) {
+                  | Some(e) => {
+                      val cb = binFor(e.k, genOfBin(b) + 1)
+                      slotIdx.exists(t =>
+                        st.header.get(cb).slotState.get(t) == Valid and
+                        st.slotVal.get(cb).get(t) == Some(e))
+                    }
+                  | None => true   // deleted before the sentinel: skipped
+                },
+              }),
+            })
+        | None => true
+      }
+    )
+
+  // R12b: child free-slot existence (design §7.12, promoted from §4 prose):
+  // while a parent is mid-transfer, the child the next pending entry routes
+  // to has a free slot (the spec analogue of resize.go's "can never fail").
+  pure def rsChildFreeSlotPure(st: SpecState, snap: BinIdx -> Option[Header],
+      cur: BinIdx -> SlotIdx): bool =
+    binDomain.forall(b =>
+      (st.header.get(b).binState == InTransfer).implies(
+        match snap.get(b) {
+          | Some(sn) => {
+              val s = nextSlot(sn, cur.get(b))
+              (s != 0).implies(
+                match (if (s == 0) None else st.slotVal.get(b).get(s)) {
+                  | Some(e) => {
+                      val cb = binFor(e.k, genOfBin(b) + 1)
+                      slotIdx.exists(t => st.header.get(cb).slotState.get(t) == Invalid)
+                    }
+                  | None => true
+                })
+            }
+          | None => true
+        })
+    )
+
+  // R16 (1b consecution support — counterexample-driven): an unprocessed
+  // transferable key is FRESH (absent) in its child. For an InTransfer parent
+  // and a snapshot Valid/Shadow slot s NOT yet processed (s > cursor), the
+  // child binFor(entry.k, gen+1) holds no live (Valid/Shadow) slot for that
+  // key. Mechanism: a child receives key k ONLY from its parent's single
+  // transfer of k (k routes to exactly that child, one source), so before the
+  // parent processes k the child has no k. Interlocks with R9 across rsBegin
+  // (a NoTransfer parent's children are pristine, so just after the
+  // InTransfer flip no key is in the child yet) and converts to "processed"
+  // at the carry step (cursor advances to s, antecedent false). Why
+  // consecution needs it: without it the anchor fabricates a child already
+  // holding a Valid k while the parent still has an unprocessed Shadow/Valid
+  // k to carry, and rsShadowCarry/rsMove then place a SECOND k in the child,
+  // breaking liveKeyUniquePerBin. The key is read from the ENTRY
+  // (slotVal.k), robust to a sentineled slotKey. In rsInvPure, not invPure
+  // (maxGen=0 has no InTransfer bins). The explicit genOfBin(b) < maxGen guard
+  // keeps binFor(_, gen+1) in-domain (implied by InTransfer via genTopology).
+  pure def rsChildKeyFreshPure(st: SpecState, snap: BinIdx -> Option[Header],
+      cur: BinIdx -> SlotIdx): bool =
+    binDomain.forall(b =>
+      (st.header.get(b).binState == InTransfer and genOfBin(b) < maxGen).implies(
+        match snap.get(b) {
+          | Some(sn) =>
+              slotIdx.forall(s =>
+                (s > cur.get(b) and
+                  (sn.slotState.get(s) == Valid or sn.slotState.get(s) == Shadow)).implies(
+                  match st.slotVal.get(b).get(s) {
+                    | Some(e) => {
+                        val cb = binFor(e.k, genOfBin(b) + 1)
+                        slotIdx.forall(t =>
+                          not((st.header.get(cb).slotState.get(t) == Valid or
+                                st.header.get(cb).slotState.get(t) == Shadow) and
+                              st.slotKey.get(cb).get(t) == Some(HKey(e.k))))
+                      }
+                    | None => true
+                  }))
+          | None => true
+        }))
+
+  // R24 (2gen consecution support — counterexample-driven, grp3 rsChildFreeSlot
+  // + grp4 rsChildKeyFresh): ENTRY placement. Every live entry sits in the bin
+  // its key hashes to FOR THAT BIN'S GENERATION:
+  //     slotVal[b][s] == Some(e)  ==>  binFor(e.k, genOfBin(b)) == b.
+  //
+  // This is the ENTRY (slotVal) analogue of hashConsistency, which pins only
+  // the slotKey WORD. The two diverge exactly at a sentineled slot: rsMove
+  // rewrites slotKey -> HSentinel but (deliberately, per R11's no-clear rule)
+  // does NOT clear slotVal, so a mid-transfer parent slot carries slotKey ==
+  // HSentinel while still holding its original entry. hashConsistency's HKey
+  // arm is then vacuous and NOTHING constrains that entry's key — so the anchor
+  // was free to fabricate a sentineled slot in bin b holding an entry whose key
+  // routes to a DIFFERENT bin. rsChildFreeSlot (R12b) and rsChildKeyFresh (R16)
+  // both route the pending entry by slotVal.k (they must — the slotKey is a
+  // sentinel), so a misrouted entry made them target the wrong child and fail:
+  // two gen-1 bins carrying the same key into one gen-2 child (grp4 collision),
+  // or a concurrent insert filling the child that a misrouted carry then needs
+  // (grp3 exhaustion). Both CEX pre-states park a live entry in a bin NO key
+  // hashes to (bin3, gen1-odd, in the k1->0/k2->2 configs) — impossible for a
+  // reachable slotVal.
+  //   Reachable-true because every slotVal WRITE is binFor-addressed: Insert /
+  // LC publish to binFor(k, local.gen) (== b, with genOfBin(b) == local.gen);
+  // rsMove / rsShadowCarry publish the child at binFor(k, genOfBin(parent)+1)
+  // (== cb, with genOfBin(cb) == genOfBin(parent)+1); Delete / abort clear to
+  // None (vacuous). No step writes an entry to a non-home bin, so this anchor
+  // conjunct is SELF-SUPPORTING (inductive with no new support lemma).
+  //   In rsInvPure, not invPure: at maxGen=0 there is one bin and binFor(_,0)
+  // == 1 for every key, so the clause is trivially true (Phase-0 inert), and
+  // the sentinel divergence that motivates it cannot occur without a resize.
+  pure def rsEntryHomePure(st: SpecState): bool =
+    binDomain.forall(b =>
+      slotIdx.forall(s =>
+        match st.slotVal.get(b).get(s) {
+          | Some(e) => binFor(e.k, genOfBin(b)) == b
+          | None => true
+        }))
+
+  // R12: cross-generation claim continuity (§7.7, the PRECISE form): at most
+  // one Shadow-k among NoTransfer bins (parent InTransfer exempt during the
+  // carry window; dead parents exempt forever).
+  pure def rsShadowAt(st: SpecState, k: KEY, b: BinIdx, s: SlotIdx): bool =
+    st.header.get(b).binState == NoTransfer and
+    st.header.get(b).slotState.get(s) == Shadow and
+    st.slotKey.get(b).get(s) == Some(HKey(k))
+
+  pure def rsClaimContinuityPure(st: SpecState): bool =
+    keyDomain.forall(k =>
+      binDomain.forall(b1 => binDomain.forall(b2 =>
+        slotIdx.forall(s1 => slotIdx.forall(s2 =>
+          (rsShadowAt(st, k, b1, s1) and rsShadowAt(st, k, b2, s2))
+            .implies(b1 == b2 and s1 == s2)
+        ))))
+    )
+
+  // R15 (1b consecution support — counterexample-driven, NOT in the design's
+  // predicted list): wherever h0 is a SETTLED snapshot, it was loaded from a
+  // NoTransfer header. The fused classification (G1/I1/P1/D1/LC1, design §5)
+  // stores h0 ONLY on its NoTransfer branch; no later step refreshes h0 EXCEPT
+  // LC10 relocation (which lands at PcLC6 and can set h0 to a non-NoTransfer
+  // child). So h0.binState == NoTransfer at every h0-live PC except the LC
+  // commit window {PcLC6,PcLC7,PcLC8,PcLC9} reachable after an LC10.
+  //   Why consecution needs it: reservedKeyFresh / reservedKeyFreshAtReserve /
+  // absentReturnConsistent all key off h0.binState (via expectedH or
+  // header==h0). Without this fact the anchor fabricates an InTransfer h0 —
+  // which passes those families VACUOUSLY at the anchor (the live bin is
+  // NoTransfer, so live != the expectedH/h0 whose binState is the fabricated
+  // InTransfer) — and then rsBegin flips the live bin to InTransfer WITHOUT a
+  // version bump (Go's OR), springing header==expectedH / header==h0 on a bin
+  // that legitimately still holds a Valid entry for the key.
+  //   Lives in rsInvPure, not invPure: maxGen=0 never has an rsBegin to spring
+  // the trap, so the Phase-0 anchor neither needs nor re-verifies it.
+  // Inductive: every entry into a settled PC is either a classifying
+  // NoTransfer branch (h0 := a NoTransfer header) or inherits h0 unchanged
+  // from another settled PC; the LC retry/abort edges reload at PcLC1 or go
+  // idle, never carrying a stale h0 into a settled PC. PcLC6..LC9 are excluded
+  // because LC10 can settle a non-NoTransfer child header there (those PCs use
+  // hLoop, not h0, in their guards).
+  pure val h0SettledPCs: Set[PC] = Set(
+    PcG2, PcI2, PcI3, PcI4, PcI5, PcI6,
+    PcP2, PcP3, PcP4, PcP5, PcP6, PcP7,
+    PcD2, PcD3, PcD4, PcD5, PcD6, PcD7, PcD8,
+    PcLC2, PcLC3, PcLC4, PcLC5
+  )
+  pure def h0LoadedNoTransferPure(st: SpecState): bool =
+    procSet.forall(p =>
+      h0SettledPCs.contains(st.pc.get(p)).implies(
+        st.local.get(p).h0.binState == NoTransfer))
+
+  // R17 (1b consecution support): the hLoop analogue of h0LoadedNoTransfer.
+  // hLoop is loaded via a CLASSIFYING load — D4 for Delete (classify ->
+  // full-retry, design §5) and LC6 for LoadOrCompute (spin on InTransfer /
+  // relocate on Done / store hLoop and proceed to LC7 ONLY on NoTransfer) --
+  // so at those settled hLoop PCs hLoop.binState == NoTransfer. Put's P4 is
+  // EXCLUDED: it has NO binState check (design §5, the carried-Put), so Put's
+  // hLoop can legitimately be InTransfer.
+  //   Why consecution needs it: LC7's commit/abort does updateSlotState (a
+  // VERSION BUMP). lc7SuccessGuard fires on header == hLoop, so a fabricated
+  // InTransfer hLoop matching an InTransfer live bin would let LC7 bump the
+  // version of an InTransfer bin -- breaking R6's InTransfer version-freeze.
+  // The §5 LC6 rule (spin on InTransfer, never reach LC7) prevents exactly
+  // this; R17 is its invariant consequence. (P7/D7 are header-silent -- no
+  // version bump -- so Put/Delete on an InTransfer bin do not hit R6; the
+  // Delete window is included only because D4 makes it reachable-true.)
+  //   In rsInvPure (maxGen=0 has no InTransfer bins). Inductive: PcLC7 is
+  // entered only via LC6's NoTransfer branch; PcD5..D7 only via D4's.
+  pure val hLoopSettledPCs: Set[PC] = Set(PcD5, PcD6, PcD7, PcLC7)
+  pure def hLoopLoadedNoTransferPure(st: SpecState): bool =
+    procSet.forall(p =>
+      hLoopSettledPCs.contains(st.pc.get(p)).implies(
+        st.local.get(p).hLoop.binState == NoTransfer))
+
+  // R18 (1b consecution support): every Shadow slot is WELL-FORMED — keyed
+  // HKey(k), carrying the ghost placeholder slotVal == Some({k, anyVal}) and a
+  // tag. Both producers write exactly this (LC4's reserve-fill and
+  // rsShadowCarry's carry), a Shadow is never sentineled (rsSentinel skips
+  // Shadow) and never has its val cleared while Shadow (LC7 abort first flips
+  // it to Trying), so this holds for owned, carried, AND dead-bin Shadows.
+  //   This is the carried-Shadow analogue of ownerSlotFilled (F2): F2 only
+  // covers a Shadow whose holder sits at PcLC5..LC9, but a holder parked at
+  // PcLC10 (pre-relocation) leaves its carried child Shadow outside F2 — the
+  // anchor then fabricates that Shadow with slotVal == None, and LC10's
+  // relocation lands the holder at PcLC6 where F2 demands the (now-owned) slot
+  // be filled, breaking F2. shadowGhostForm rejects the ill-formed Shadow at
+  // the anchor. In rsInvPure: at maxGen=0 shadowOwnedUnique forces every
+  // Shadow owned, so F2 already implies it (no Phase-0 need / re-verify).
+  pure def shadowGhostFormPure(st: SpecState): bool =
+    binDomain.forall(b =>
+      slotIdx.forall(s =>
+        (st.header.get(b).slotState.get(s) == Shadow).implies(
+          match st.slotKey.get(b).get(s) {
+            | Some(hk) => match hk {
+                | HKey(k) =>
+                    st.slotVal.get(b).get(s) == Some({ k: k, v: anyVal }) and
+                    st.slotTag.get(b).get(s) != None
+                | HSentinel => false   // a Shadow is never sentineled
+              }
+            | None => false            // Shadow => slotKey != None (shadowSlotKeyed)
+          })))
+
+  // R19 (1b consecution support): a relocating holder's CURRENT bin is dead.
+  // LC6 routes to PcLC10 ONLY on its DoneTransfer branch, and bins never leave
+  // Done, so a holder parked at PcLC10 has binFor(k, gen) == DoneTransfer.
+  //   Why consecution needs it: LC10's found-branch advances the holder to
+  // gen+1. predecessorsDone (R3) then demands every generation below the new
+  // gen be Done for k -- in particular the just-left gen. Without R19 the
+  // anchor fabricates a PcLC10 holder whose gen bin is still InTransfer; LC10
+  // advances past it and predecessorsDone breaks. R19 also SUBSUMES the
+  // deferred lc10GenBound: a Done bin lies in a gen < maxGen (genTopology +
+  // typeOK: Done at g==activeGen forces maxAllocatedGen==activeGen+1<=maxGen),
+  // so binFor(k, gen+1) is in-domain. In rsInvPure (PcLC10 is unreachable at
+  // maxGen=0 -- no Done bins). Inductive: PcLC10 entered only via LC6's Done
+  // branch; the LC10 wait-branch keeps gen (and the Done bin) unchanged.
+  pure def lc10AtDonePure(st: SpecState): bool =
+    procSet.forall(p =>
+      (st.pc.get(p) == PcLC10).implies(
+        st.header.get(binFor(keyOfProcIn(st, p), st.local.get(p).gen)).binState == DoneTransfer))
+
+  pure def rsInvPure(st: SpecState, snap: BinIdx -> Option[Header],
+      cur: BinIdx -> SlotIdx): bool =
+    rsSnapshotRelationPure(st, snap) and
+      rsSentinelDisciplinePure(st, snap) and
+      rsChildUnobservablePure(st) and
+      rsCursorCoherencePure(st, snap, cur) and
+      rsCompletenessPure(st, snap, cur) and
+      rsChildFreeSlotPure(st, snap, cur) and
+      rsClaimContinuityPure(st) and
+      h0LoadedNoTransferPure(st) and
+      rsChildKeyFreshPure(st, snap, cur) and
+      hLoopLoadedNoTransferPure(st) and
+      shadowGhostFormPure(st) and
+      lc10AtDonePure(st) and
+      tryingOwnerUniquePure(st) and
+      carriedClaimExistsPure(st) and
+      rsEntryHomePure(st)
+
+  // (The live rsInv wrapper lives in system.qnt per the wiring rule — NOT
+  // here.)
+
   // ======================= CONTRACT COROLLARIES ===========================
+  // STAGE-1c NOTE (review adjudication): the fn windows below deliberately
+  // remain {PcLC6, PcLC7} — design §7's contract paragraph says "window
+  // unchanged" and stages the cross-generation extension (incl. the parked
+  // PcLC10 relocation state) to 1c, where it needs a claim-existence support
+  // family first: nothing in inv yet forces a PcLC10 proc to POSSESS a
+  // carried claim, so widening the window today would be falsifiable on
+  // anchor states while changing nothing on reachable ones.
   // LoadOrCompute CONTRACT properties, machine-checked as
   //     inv ⟹ corollary
   // by a 0-step Apalache run from the induction anchor (indInit guards every
@@ -670,7 +1376,7 @@ module invariants {
   pure def contractHolderExclusivePure(st: SpecState): bool =
     procSet.forall(p => {
       val k = keyOfProcIn(st, p)
-      val b = binOf(k)
+      val b = binFor(k, st.local.get(p).gen)
       val s = st.local.get(p).targetSlot
       val inFnWindow =
         st.op.get(p) == Some(LoadOrCompute) and
@@ -678,8 +1384,8 @@ module invariants {
       inFnWindow.implies(
         slotIdx.contains(s) and
         st.header.get(b).slotState.get(s) == Shadow and
-        st.slotKey.get(b).get(s) == Some(k) and
-        visibleSlotsByHeaderFrom(st.header.get(b), st.slotKey, st.slotVal, st.slotTag, b, k).size() == 0
+        st.slotKey.get(b).get(s) == Some(HKey(k)) and
+        visibleSlotsByHeaderFrom(st.header.get(b), st.slotVal, st.slotTag, b, k).size() == 0
       )
     })
 
@@ -712,6 +1418,11 @@ module invariants {
   def snapStateAgrees = snapStateAgreesPure(currentSpecState)
   def freshReservationEmpty = freshReservationEmptyPure(currentSpecState)
   def absentReturnConsistent = absentReturnConsistentPure(currentSpecState)
+  def genTopology = genTopologyPure(currentSpecState)
+  def pristineFutureGens = pristineFutureGensPure(currentSpecState)
+  def predecessorsDone = predecessorsDonePure(currentSpecState)
+  def opGenSanity = opGenSanityPure(currentSpecState)
+  def entryKeyAgreement = entryKeyAgreementPure(currentSpecState)
 
   // Contract-corollary wrappers (checked standalone as inv ⟹ corollary in
   // verify.sh stage 4; NOT part of inv/invPure — see the section above).
@@ -749,7 +1460,12 @@ module invariants {
       versionMonotonicPure(st) and
       snapStateAgreesPure(st) and
       freshReservationEmptyPure(st) and
-      absentReturnConsistentPure(st)
+      absentReturnConsistentPure(st) and
+      genTopologyPure(st) and
+      pristineFutureGensPure(st) and
+      predecessorsDonePure(st) and
+      opGenSanityPure(st) and
+      entryKeyAgreementPure(st)
 
   def inv: bool = invPure(currentSpecState)
 

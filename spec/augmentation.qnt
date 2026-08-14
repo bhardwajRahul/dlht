@@ -30,6 +30,9 @@ module augmentation {
 
   pure def evolve2(P: Set[Config]): Set[Config] = evolve1(evolve1(P))
 
+  // NOTE: caps at bound 2 — any bound >= 2 checks exactly evolve2 (P ∪ e1 ∪ e2).
+  // A config passing refineBound = 3 would SILENTLY check bound 2. All current
+  // configs use 2; extend this if-chain (evolve3, ...) before raising any bound.
   pure def boundedEvolve(P: Set[Config], bound: int): Set[Config] = {
     if (bound == 0) P
     else if (bound == 1) P.union(evolve1(P))

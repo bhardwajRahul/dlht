@@ -12,8 +12,12 @@ const (
 	// falls in (minSizeForMallocHeader, maxSmallSize-mallocHeaderSize]. Smaller
 	// allocations keep their pointer bits in the span bitmap; larger ones go
 	// through the large-object path on a page-aligned span. See
-	// internal/runtime/gc in the Go tree.
-	// https://github.com/golang/go/blob/go1.25.3/src/internal/runtime/gc/sizeclasses.go#L86
+	// internal/runtime/gc in the Go tree. Verified against go1.27rc1, where the
+	// floor is MinSizeForMallocHeader = goarch.PtrSize*goarch.PtrBits = 512 on
+	// 64-bit (this package is 64-bit only) and the runtime asserts at startup
+	// that it lands on a size-class boundary.
+	// https://github.com/golang/go/blob/go1.27rc1/src/internal/runtime/gc/malloc.go#L17
+	// https://github.com/golang/go/blob/go1.27rc1/src/internal/runtime/gc/sizeclasses.go#L86
 	minSizeForMallocHeader = 512
 	mallocHeaderSize       = 8
 	maxSmallSize           = 32 * 1024
@@ -21,7 +25,7 @@ const (
 
 	// Smallest bucket count whose byte size overflows mallocgc's headered-small
 	// ceiling, forcing the allocation onto the page-aligned large-object path.
-	// https://github.com/golang/go/blob/go1.25.3/src/runtime/malloc.go#L998
+	// https://github.com/golang/go/blob/go1.27rc1/src/runtime/malloc.go#L1140
 	largeBufferSize = (maxSmallSize-mallocHeaderSize)/bucketByteSize + 1 // = 512
 )
 

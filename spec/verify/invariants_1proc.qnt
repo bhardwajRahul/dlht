@@ -3,9 +3,9 @@ module invariants_1proc {
     procSet = Set("p1"),
     keyDomain = Set("k1"),
     valDomain = Set("v1", "v2"),
-    numBins = 1,
+    maxGen = 0,
     slotsPerBin = 3,
-    hash = Map("k1" -> 1),
+    hashRaw = Map("k1" -> 0),
   ).* from "../invariants"
 
   action init = invariantsInit
