@@ -61,10 +61,9 @@ func (r *PorcupineResult) WriteVisualizations(prefix string) []string {
 	return filenames
 }
 
-// perKeyModel creates a porcupine.Model for single-key linearizability checking.
-// The Step function checks ALL output fields (Found, Updated, Value) for every
-// operation, matching the strictness of the custom oracle in oracle.go.
-// This ensures both oracles agree on every history.
+// perKeyModel creates a porcupine.Model for single-key linearizability
+// checking. The Step function checks every output field (Found, Updated,
+// Value), so a wrong old value fails even when the success flag is right.
 func perKeyModel[V comparable](initial perKeyState[V]) porcupine.Model {
 	return porcupine.Model{
 		Init: func() any {
@@ -126,27 +125,27 @@ func perKeyModel[V comparable](initial perKeyState[V]) porcupine.Model {
 			switch in.Kind {
 			case OpGet:
 				if out.Found {
-					return fmt.Sprintf("Get → %v (found)", out.Value)
+					return fmt.Sprintf("Get -> %v (found)", out.Value)
 				}
-				return "Get → not found"
+				return "Get -> not found"
 			case OpInsert:
 				if out.Found {
-					return fmt.Sprintf("Insert(%v) → ok", in.Value)
+					return fmt.Sprintf("Insert(%v) -> ok", in.Value)
 				}
 				if out.Updated {
-					return fmt.Sprintf("Insert(%v) → exists (prev %v, updated?)", in.Value, out.Value)
+					return fmt.Sprintf("Insert(%v) -> exists (prev %v, updated?)", in.Value, out.Value)
 				}
-				return fmt.Sprintf("Insert(%v) → exists (prev %v)", in.Value, out.Value)
+				return fmt.Sprintf("Insert(%v) -> exists (prev %v)", in.Value, out.Value)
 			case OpPut:
 				if out.Updated {
-					return fmt.Sprintf("Put(%v) → updated (old %v)", in.Value, out.Value)
+					return fmt.Sprintf("Put(%v) -> updated (old %v)", in.Value, out.Value)
 				}
-				return fmt.Sprintf("Put(%v) → not found", in.Value)
+				return fmt.Sprintf("Put(%v) -> not found", in.Value)
 			case OpDelete:
 				if out.Found {
-					return fmt.Sprintf("Delete → deleted (was %v)", out.Value)
+					return fmt.Sprintf("Delete -> deleted (was %v)", out.Value)
 				}
-				return "Delete → not found"
+				return "Delete -> not found"
 			default:
 				return fmt.Sprintf("Unknown(%d)", in.Kind)
 			}
@@ -225,17 +224,14 @@ func ValidatePerKeyLinearizablePorcupineFromInitial[K comparable, V comparable](
 				Info:  info,
 			})
 		case porcupine.Unknown:
-			// Timeout. Inconclusive, treat as ok for now
+			// Timeout: the history was not verified, and an unverified
+			// history must not read as a passing test.
+			result.Ok = false
+			if result.Reason == "" {
+				result.Reason = fmt.Sprintf("key=%v: porcupine inconclusive (timeout)", key)
+			}
 		}
 	}
 
 	return result
-}
-
-// validateKeyOpsWithPorcupine performs a simple yes/no per-key linearizability
-// check using Porcupine. Used by the minimizer where verbose output is not needed.
-func validateKeyOpsWithPorcupine[K comparable, V comparable](ops []TimedOp[K, V], initial keyState[V]) bool {
-	initState := perKeyState[V]{exists: initial.exists, value: initial.value}
-	model := perKeyModel(initState)
-	return porcupine.CheckOperations(model, toPorcupineEvents(ops))
 }

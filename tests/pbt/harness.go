@@ -2,18 +2,16 @@ package pbt
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
+	"time"
 
 	"github.com/jeremiah-masters/dlht"
 
 	"pgregory.net/rapid"
 )
 
-type fatalfOnly interface {
-	Fatalf(format string, args ...any)
-}
-
-func execOp[K dlht.Key, V any](tb fatalfOnly, m *dlht.Map[K, V], op Op[K, V]) OpResult[V] {
+func execOp[K dlht.Key, V any](m *dlht.Map[K, V], op Op[K, V]) OpResult[V] {
 	switch op.Kind {
 	case OpGet:
 		val, ok := m.Get(op.Key)
@@ -28,9 +26,7 @@ func execOp[K dlht.Key, V any](tb fatalfOnly, m *dlht.Map[K, V], op Op[K, V]) Op
 		deleted, ok := m.Delete(op.Key)
 		return OpResult[V]{Found: ok, Value: deleted}
 	default:
-		tb.Fatalf("unknown op kind: %d", op.Kind)
-		var zero V
-		return OpResult[V]{Value: zero}
+		panic(fmt.Sprintf("unknown op kind: %d", op.Kind))
 	}
 }
 
@@ -42,7 +38,10 @@ func drawOpsByThread[K comparable, V any](t *rapid.T, threads int, opsGen *rapid
 	return opsByThread
 }
 
-func runConcurrentHistory[K dlht.Key, V any](tb fatalfOnly, m *dlht.Map[K, V], opsByThread [][]Op[K, V]) []TimedOp[K, V] {
+// runConcurrentHistory executes each thread's ops on its own goroutine and
+// returns the merged timed history. All rapid draws must happen before the
+// call; nothing here touches *rapid.T.
+func runConcurrentHistory[K dlht.Key, V any](m *dlht.Map[K, V], opsByThread [][]Op[K, V]) []TimedOp[K, V] {
 	var seq SeqCounter
 	localHistories := make([][]TimedOp[K, V], len(opsByThread))
 
@@ -54,7 +53,7 @@ func runConcurrentHistory[K dlht.Key, V any](tb fatalfOnly, m *dlht.Map[K, V], o
 			threadHistory := make([]TimedOp[K, V], 0, len(threadOps))
 			for _, op := range threadOps {
 				start := seq.Start()
-				res := execOp(tb, m, op)
+				res := execOp(m, op)
 				end := seq.End()
 				threadHistory = append(threadHistory, TimedOp[K, V]{
 					Op:       op,
@@ -96,10 +95,78 @@ func runPerKeyLinearizabilityCase[K dlht.Key](t *rapid.T, initialSize uint64, th
 	opsByThread := drawOpsByThread(t, threads, opsGen, "ops")
 
 	m := dlht.New[K, int](dlht.Options{InitialSize: initialSize})
-	history := runConcurrentHistory(t, m, opsByThread)
+	history := runConcurrentHistory(m, opsByThread)
 
-	ok, reason := ValidatePerKeyLinearizable(history, MaxOracleStates)
-	if !ok {
-		t.Fatalf("per-key linearizability failed: %s", reason)
+	if res := ValidatePerKeyLinearizablePorcupineFromInitial(history, nil); !res.Ok {
+		t.Fatalf("per-key linearizability failed: %s", res.Reason)
+	}
+}
+
+// setGOMAXPROCS sets GOMAXPROCS for the duration of one test case and returns
+// a restore func. Concurrent property tests sweep this as a grid axis: 1
+// exercises the cooperative-yield paths, higher values buy real parallelism.
+// Callers must not use t.Parallel.
+func setGOMAXPROCS(n int) (restore func()) {
+	prev := runtime.GOMAXPROCS(n)
+	return func() { runtime.GOMAXPROCS(prev) }
+}
+
+// gomaxprocsAxis is the sweep for concurrent grid tests.
+func gomaxprocsAxis() []int {
+	n := runtime.NumCPU()
+	axis := []int{1, 2}
+	if n > 2 {
+		axis = append(axis, n)
+	}
+	return axis
+}
+
+// errSlots collects at most one error per worker goroutine. testing.T.Fatalf
+// must not be called off the test goroutine, so workers record here and the
+// test goroutine reports after join.
+type errSlots struct {
+	errs []error
+}
+
+func newErrSlots(n int) *errSlots { return &errSlots{errs: make([]error, n)} }
+
+// set records err for the worker; only the first error per slot is kept.
+func (e *errSlots) set(worker int, err error) {
+	if e.errs[worker] == nil {
+		e.errs[worker] = err
+	}
+}
+
+// first returns the first recorded error, or nil.
+func (e *errSlots) first() error {
+	for _, err := range e.errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// waitWithWatchdog waits for wg with a deadline. On timeout it returns all
+// goroutine stacks so a hang points at the blocked path instead of the
+// package-level test timeout.
+func waitWithWatchdog(wg *sync.WaitGroup, budget time.Duration) (stacks string, ok bool) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return "", true
+	case <-time.After(budget):
+		buf := make([]byte, 1<<20)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				return string(buf[:n]), false
+			}
+			buf = make([]byte, 2*len(buf))
+		}
 	}
 }

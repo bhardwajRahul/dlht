@@ -11,6 +11,11 @@ import (
 	"pgregory.net/rapid"
 )
 
+// Multi-generation indexNext traversal: a growth thread stacks several resize
+// generations on a tiny table while churn threads hammer a few persistent
+// keys. Laggards must walk indexNext generation by generation; skipping to
+// m.active reads bins whose transfer landed elsewhere. Checked per key with
+// Porcupine (real-time order included).
 func TestPBTIndexNextTraversal(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		initialSize := rapid.Uint64Range(2, 4).Draw(t, "initialSize")
@@ -58,21 +63,15 @@ func TestPBTIndexNextTraversal(t *testing.T) {
 		}
 		opsByThread = append(opsByThread, growthThread)
 
-		history := runConcurrentHistory(t, m, opsByThread)
+		history := runConcurrentHistory(m, opsByThread)
 
-		ok, reason := ValidatePerKeyLinearizableFromInitial(history, initialState, MaxOracleStatesLarge)
-		if !ok {
-			pResult := ValidatePerKeyLinearizablePorcupineFromInitial(history, initialState)
-			if pResult.Ok {
-				t.Fatalf("per-key linearizability failed by custom oracle only: %s\n%s", reason, formatFailedKeyHistory(history, reason))
-			}
+		if pResult := ValidatePerKeyLinearizablePorcupineFromInitial(history, initialState); !pResult.Ok {
 			filenames := pResult.WriteVisualizations("index_next_traversal")
 			t.Fatalf(
-				"per-key linearizability failed: custom=%s; porcupine=%s\nvisualizations: %v\n%s",
-				reason,
+				"per-key linearizability failed: %s\nvisualizations: %v\n%s",
 				pResult.Reason,
 				filenames,
-				formatFailedKeyHistory(history, reason),
+				formatFailedKeyHistory(history, pResult.Reason),
 			)
 		}
 
@@ -125,7 +124,6 @@ func formatFailedKeyHistory(history []TimedOp[string, int], reason string) strin
 		}
 		return keyOps[i].StartSeq < keyOps[j].StartSeq
 	})
-	minimized := minimizeUnsatKeyOps(keyOps)
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("failed-key-history key=%s ops=%d\n", key, len(keyOps)))
 	for idx := range keyOps {
@@ -146,65 +144,7 @@ func formatFailedKeyHistory(history []TimedOp[string, int], reason string) strin
 	if witness := findIntervalWitness(keyOps); witness != "" {
 		b.WriteString(fmt.Sprintf("failed-key-interval-witness: %s\n", witness))
 	}
-	if len(minimized) > 0 && len(minimized) < len(keyOps) {
-		b.WriteString(fmt.Sprintf("failed-key-history-minimized key=%s ops=%d\n", key, len(minimized)))
-		for idx := range minimized {
-			op := minimized[idx]
-			b.WriteString(fmt.Sprintf(
-				"  [m%02d] %s(%q,%d) => found=%v updated=%v value=%d [%d,%d]\n",
-				idx,
-				op.Op.Kind,
-				op.Op.Key,
-				op.Op.Value,
-				op.Result.Found,
-				op.Result.Updated,
-				op.Result.Value,
-				op.StartSeq,
-				op.EndSeq,
-			))
-		}
-	}
 	return b.String()
-}
-
-func minimizeUnsatKeyOps(ops []TimedOp[string, int]) []TimedOp[string, int] {
-	if len(ops) <= 1 {
-		return nil
-	}
-	initial := keyState[int]{exists: true, value: parseInitialValueFromKey(ops[0].Op.Key)}
-	cur := append([]TimedOp[string, int](nil), ops...)
-	changed := true
-	for changed {
-		changed = false
-		for i := 0; i < len(cur); i++ {
-			cand := make([]TimedOp[string, int], 0, len(cur)-1)
-			cand = append(cand, cur[:i]...)
-			cand = append(cand, cur[i+1:]...)
-			if len(cand) == 0 {
-				continue
-			}
-			okCustom, _, _ := validateKeyOpsWithInitial(cand, initial, MaxOracleStatesLarge)
-			okPorc := validateKeyOpsWithPorcupine(cand, initial)
-			if !okCustom && !okPorc {
-				cur = cand
-				changed = true
-				break
-			}
-		}
-	}
-	if len(cur) == len(ops) {
-		return nil
-	}
-	return cur
-}
-
-func parseInitialValueFromKey(key string) int {
-	var idx int
-	_, err := fmt.Sscanf(key, "persist_%d", &idx)
-	if err != nil {
-		return 0
-	}
-	return idx
 }
 
 func findIntervalWitness(ops []TimedOp[string, int]) string {
